@@ -1,0 +1,1172 @@
+量化交易引擎 (Quant Engine) 使用白皮书
+目录
+
+    系统概述
+    快速开始
+    核心模块详解
+    策略开发指南
+    API 参考
+    最佳实践
+    专业建议
+    常见问题
+
+1. 系统概述
+1.1 架构总览
+
+text
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Quant Engine v1.0                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌─────────────┐                                                           │
+│   │   main.py   │  ◄── CLI 统一入口                                        │
+│   └──────┬──────┘                                                           │
+│          │                                                                  │
+│   ┌──────┴──────────────────────────────────────────────────────────┐      │
+│   │                         scripts/                                 │      │
+│   │  init_database.py │ daily_update.py │ run_backtest.py │ scan.py │      │
+│   └──────┬──────────────────────────────────────────────────────────┘      │
+│          │                                                                  │
+│   ┌──────┴──────────────────────────────────────────────────────────┐      │
+│   │                                                                  │      │
+│   │  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────────┐ │      │
+│   │  │  core/   │   │ factors/ │   │ strategy/│   │   engine/    │ │      │
+│   │  │ 数据采集 │──►│ 因子计算 │──►│ 信号生成 │──►│ 回测/撮合   │ │      │
+│   │  └──────────┘   └──────────┘   └──────────┘   └──────────────┘ │      │
+│   │       │                                              │         │      │
+│   │       └──────────────────┬───────────────────────────┘         │      │
+│   │                          ▼                                      │      │
+│   │                   ┌──────────────┐                              │      │
+│   │                   │  analysis/   │                              │      │
+│   │                   │ 扫描/诊断/报告│                              │      │
+│   │                   └──────────────┘                              │      │
+│   │                                                                  │      │
+│   └──────────────────────────────────────────────────────────────────┘      │
+│                                                                             │
+│   ┌───────────────────┐   ┌───────────────────┐                            │
+│   │      config/      │   │      utils/       │                            │
+│   │    全局配置中心    │   │  日志/装饰器/工具  │                            │
+│   └───────────────────┘   └───────────────────┘                            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+1.2 核心特性
+特性	说明
+插件化策略	继承 BaseStrategy 即可实现新策略，无需修改引擎代码
+向量化计算	全面使用 NumPy/Pandas 向量化，无 for 循环遍历 K 线
+多进程并行	数据下载、因子计算支持多核并行
+DuckDB 存储	高性能分析型数据库，秒级全市场查询
+T+1 严格模拟	涨跌停、滑点、手续费完整模拟
+模块解耦	因子/策略/引擎完全分离，独立测试
+1.3 技术栈
+
+YAML
+
+核心依赖:
+  - Python: ">=3.9"
+  - pandas: ">=1.5.0"
+  - numpy: ">=1.23.0"
+  - duckdb: ">=0.9.0"
+  - pytdx: ">=1.72"
+  - click: ">=8.0"
+
+可选依赖:
+  - pytest: ">=7.0"      # 测试
+  - schedule: ">=1.2"    # 定时任务
+  - matplotlib: ">=3.6"  # 可视化
+
+2. 快速开始
+2.1 安装
+
+Bash
+
+# 克隆项目
+git clone https://github.com/your-repo/quant_engine.git
+cd quant_engine
+
+# 创建虚拟环境
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+# 安装依赖
+pip install -r requirements.txt
+
+requirements.txt:
+
+text
+
+pandas>=1.5.0
+numpy>=1.23.0
+duckdb>=0.9.0
+pytdx>=1.72
+click>=8.0
+pytest>=7.0
+schedule>=1.2
+
+2.2 初始化数据库
+
+Bash
+
+# 首次使用，下载全量历史数据 (约需 30-60 分钟)
+python main.py init
+
+# 或指定参数
+python main.py init --workers 8  # 8 进程并行
+
+2.3 每日更新
+
+Bash
+
+# 增量更新 (建议每日收盘后运行)
+python main.py update
+
+# 全量更新
+python main.py update --full
+
+2.4 运行回测
+
+Bash
+
+# RSRS 策略回测
+python main.py backtest --strategy rsrs --start 2020-01-01 --end 2023-12-31
+
+# 动量策略回测
+python main.py backtest --strategy momentum --start 2020-01-01
+
+# 自定义参数
+python main.py backtest \
+    --strategy rsrs \
+    --start 2020-01-01 \
+    --end 2023-12-31 \
+    --capital 2000000 \
+    --freq W  # 周度调仓
+
+2.5 市场扫描
+
+Bash
+
+# 扫描今日金股 (默认 Top 50)
+python main.py scan
+
+# 指定日期和数量
+python main.py scan --date 2024-01-15 --top 30
+
+# 输出到文件
+python main.py scan --top 100 --output golden_stocks.csv
+
+2.6 单股诊断
+
+Bash
+
+# 诊断平安银行
+python main.py diagnose 000001
+
+# 诊断贵州茅台
+python main.py diagnose 600519
+
+3. 核心模块详解
+3.1 配置模块 (config/)
+
+Python
+
+from config import settings
+
+# 路径配置
+settings.path.DB_PATH        # 数据库路径
+settings.path.LOG_DIR        # 日志目录
+
+# 因子配置
+settings.factor.RSRS_WINDOW         # RSRS 窗口 (默认 18)
+settings.factor.RSRS_STD_WINDOW     # 标准化窗口 (默认 600)
+settings.factor.RSRS_R2_THRESHOLD   # R² 阈值 (默认 0.8)
+
+# 回测配置
+settings.backtest.INITIAL_CAPITAL   # 初始资金 (默认 100万)
+settings.backtest.COMMISSION_RATE   # 佣金率 (默认万三)
+settings.backtest.SLIPPAGE_RATE     # 滑点率 (默认千一)
+
+# 策略配置
+settings.strategy.ENTRY_THRESHOLD   # 入场阈值 (默认 0.7)
+settings.strategy.EXIT_THRESHOLD    # 离场阈值 (默认 -0.5)
+settings.strategy.TOP_N_STOCKS      # 选股数量 (默认 30)
+
+自定义配置:
+
+Python
+
+# 方式1: 直接修改
+settings.backtest.INITIAL_CAPITAL = 2_000_000
+
+# 方式2: 环境变量
+export QUANT_INITIAL_CAPITAL=2000000
+
+# 方式3: 创建自定义配置
+from config.settings import Settings
+my_settings = Settings()
+my_settings.backtest.INITIAL_CAPITAL = 5_000_000
+
+3.2 数据模块 (core/)
+节点扫描
+
+Python
+
+from core import NodeScanner
+
+scanner = NodeScanner()
+top_nodes = scanner.scan_fastest(top_n=5)
+# [{'name': '深圳双线1', 'host': '...', 'port': 7709, 'latency_ms': 23.5}, ...]
+
+数据下载
+
+Python
+
+from core import StockDownloader
+
+downloader = StockDownloader(top_nodes)
+
+# 获取股票列表
+stock_list = downloader.get_all_stocks()
+
+# 下载全量数据
+results = downloader.download_all(stock_list, n_workers=8)
+
+# 下载单只
+df = downloader.download_single('000001', market=0)
+
+数据库操作
+
+Python
+
+from core import StockDatabase
+
+db = StockDatabase('stocks_daily.db')
+
+# 写入数据
+db.upsert(df)
+
+# 查询单股历史
+df = db.get_stock_history('000001', start='2020-01-01', end='2023-12-31')
+
+# 全市场快照
+df = db.get_market_snapshot('2024-01-15')
+
+# 多股面板数据
+df = db.get_multi_stock_panel(['000001', '600519'], '2020-01-01', '2023-12-31')
+
+# 统计信息
+stats = db.get_stats()
+# {'total_rows': 12500000, 'stocks': 5000, 'min_date': '2014-01-01', ...}
+
+3.3 因子模块 (factors/)
+因子注册表
+
+Python
+
+from factors import FactorRegistry
+
+# 列出所有因子
+FactorRegistry.list_all()
+# ['rsrs_slope', 'rsrs_zscore', 'momentum', 'atr', 'obv_trend', ...]
+
+# 按类别列出
+FactorRegistry.list_by_category('technical')
+
+# 获取因子实例
+rsrs = FactorRegistry.get('rsrs_zscore', window=18)
+
+因子计算
+
+Python
+
+from factors.technical import RSRSZScoreFactor, MomentumFactor
+
+# 单因子计算
+rsrs_factor = RSRSZScoreFactor(window=18, std_window=600)
+result = rsrs_factor.compute(df)  # 返回 pd.Series
+
+# 批量计算
+stock_data = {'000001': df1, '600519': df2, ...}
+rsrs_matrix = rsrs_factor.compute_batch(stock_data)  # 返回 DataFrame
+
+因子流水线
+
+Python
+
+from factors.base import FactorPipeline
+
+pipeline = FactorPipeline()
+pipeline.add('rsrs_zscore')
+pipeline.add('momentum', window=20)
+pipeline.add('atr_pct')
+
+results = pipeline.run(stock_data)
+# {'rsrs_zscore': DataFrame, 'momentum': DataFrame, 'atr_pct': DataFrame}
+
+3.4 策略模块 (strategy/)
+策略注册
+
+Python
+
+from strategy import StrategyRegistry, BaseStrategy, Signal, OrderSide
+
+# 注册装饰器
+@StrategyRegistry.register
+class MyStrategy(BaseStrategy):
+    name = "my_strategy"
+    version = "1.0.0"
+    
+    def compute_factors(self, history):
+        # 计算因子
+        return {'my_factor': ...}
+    
+    def generate_signals(self, context):
+        # 生成信号
+        signals = []
+        for code in context.current_data['code']:
+            if some_condition:
+                signals.append(Signal(
+                    code=code,
+                    side=OrderSide.BUY,
+                    weight=0.1,
+                    reason="满足条件"
+                ))
+        return signals
+
+策略上下文
+
+Python
+
+# context 对象包含:
+context.current_date      # 当前日期
+context.current_data      # 当日全市场行情 DataFrame
+context.history_data      # 历史数据 {code: DataFrame}
+context.factors           # 预计算因子 {name: DataFrame}
+context.positions         # 当前持仓 {code: quantity}
+context.cash              # 可用现金
+context.total_equity      # 总权益
+
+# 便捷方法
+factor_value = context.get_factor('rsrs_zscore', '000001')
+history = context.get_history('000001', lookback=60)
+
+3.5 引擎模块 (engine/)
+撮合引擎
+
+Python
+
+from engine import MatchEngine, Order, OrderStatus
+
+engine = MatchEngine(
+    commission_rate=0.0003,  # 万三
+    slippage_rate=0.001      # 千一
+)
+
+# 创建订单
+order = engine.create_order(
+    code='000001',
+    side='BUY',
+    price=10.0,
+    quantity=100,
+    create_date='2024-01-15',
+    signal_reason='RSRS 金叉'
+)
+
+# 撮合
+matched = engine.match(order, market_data, position, current_date)
+
+if matched.status == OrderStatus.FILLED:
+    print(f"成交: {matched.filled_price} × {matched.filled_quantity}")
+elif matched.status == OrderStatus.REJECTED:
+    print(f"拒绝: {matched.reject_reason}")
+
+持仓管理
+
+Python
+
+from engine import PortfolioManager
+
+portfolio = PortfolioManager(initial_capital=1_000_000)
+
+# 应用订单
+portfolio.apply_order(order, current_date)
+
+# 更新市值
+portfolio.update_market_value(market_data)
+
+# 查询
+portfolio.total_equity      # 总权益
+portfolio.cash              # 现金
+portfolio.get_weight('000001')  # 持仓权重
+portfolio.get_position('000001')  # 持仓详情
+
+# 导出
+equity_df = portfolio.get_equity_df()
+trades_df = portfolio.get_trades_df()
+
+回测引擎
+
+Python
+
+from engine import BacktestEngine
+from strategy import RSRSStrategy
+
+engine = BacktestEngine(
+    db_path='stocks_daily.db',
+    initial_capital=1_000_000
+)
+
+# 添加策略
+engine.add_strategy(RSRSStrategy(params={'top_n': 20}))
+
+# 运行回测
+results = engine.run(
+    start_date='2020-01-01',
+    end_date='2023-12-31',
+    rebalance_freq='W'
+)
+
+# 获取结果
+result = results['rsrs']
+print(result.metrics)
+equity_df = result.get_equity_curve()
+
+3.6 分析模块 (analysis/)
+市场扫描
+
+Python
+
+from analysis import MarketScanner, scan_market
+
+# 快捷方式
+df = scan_market(top_n=30)
+
+# 完整方式
+scanner = MarketScanner()
+df = scanner.scan(
+    target_date='2024-01-15',
+    top_n=50,
+    filters={'r2_min': 0.85, 'vwap_above': True}
+)
+
+单股诊断
+
+Python
+
+from analysis import StockDoctor, analyze_stock
+
+# 快捷方式
+result = analyze_stock('000001')
+
+# 完整方式
+doctor = StockDoctor()
+result = doctor.diagnose('000001')
+
+# 输出报告
+report = doctor.generate_report(result)
+print(report)
+
+# 访问详细数据
+print(result.rsrs_short)      # 18日 RSRS
+print(result.rsrs_mid)        # 60日 RSRS
+print(result.regime)          # 市场状态
+print(result.signals)         # 关键信号
+
+绩效分析
+
+Python
+
+from analysis import PerformanceAnalyzer, PerformanceMetrics
+
+analyzer = PerformanceAnalyzer(risk_free_rate=0.03)
+
+# 计算指标
+metrics = analyzer.analyze(equity_curve, trades, initial_capital)
+
+print(f"年化收益: {metrics.annual_return:.2%}")
+print(f"最大回撤: {metrics.max_drawdown:.2%}")
+print(f"夏普比率: {metrics.sharpe_ratio:.2f}")
+print(f"卡玛比率: {metrics.calmar_ratio:.2f}")
+
+# 多策略对比
+comparison = analyzer.compare({
+    'RSRS': rsrs_curve,
+    'Momentum': momentum_curve
+})
+
+# 月度收益表
+monthly = analyzer.monthly_returns(equity_curve)
+
+4. 策略开发指南
+4.1 策略模板
+
+Python
+
+"""
+自定义策略模板
+"""
+from typing import Dict, List
+import pandas as pd
+
+from strategy import BaseStrategy, Signal, OrderSide, StrategyContext
+from strategy.registry import StrategyRegistry
+from factors import FactorRegistry
+from config import settings
+
+
+@StrategyRegistry.register
+class MyCustomStrategy(BaseStrategy):
+    """
+    我的自定义策略
+    
+    策略逻辑:
+    - 入场: 条件1 AND 条件2
+    - 离场: 条件3 OR 条件4
+    """
+    
+    name = "my_custom"
+    version = "1.0.0"
+    
+    def __init__(self, params: Dict = None):
+        # 默认参数
+        default_params = {
+            'top_n': 20,
+            'entry_threshold': 0.7,
+            'exit_threshold': -0.5,
+            'lookback': 20,
+        }
+        
+        merged = {**default_params, **(params or {})}
+        super().__init__(merged)
+    
+    def compute_factors(self, history: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """
+        计算策略所需因子
+        
+        在回测开始时调用一次
+        """
+        # 使用注册的因子
+        rsrs = FactorRegistry.get('rsrs_zscore')
+        momentum = FactorRegistry.get('momentum', window=self.get_param('lookback'))
+        
+        return {
+            'rsrs': rsrs.compute_batch(history),
+            'momentum': momentum.compute_batch(history),
+        }
+    
+    def generate_signals(self, context: StrategyContext) -> List[Signal]:
+        """
+        生成交易信号
+        
+        每个交易日调用
+        """
+        signals = []
+        
+        # 1. 生成卖出信号 (先卖后买)
+        for code in list(context.positions.keys()):
+            if self._should_exit(code, context):
+                signals.append(Signal(
+                    code=code,
+                    side=OrderSide.SELL,
+                    weight=0.0,
+                    reason="触发离场条件"
+                ))
+        
+        # 2. 筛选候选股
+        candidates = self._select_candidates(context)
+        
+        # 3. 生成买入信号
+        top_n = self.get_param('top_n')
+        for code, score in candidates[:top_n]:
+            if code not in context.positions:
+                signals.append(Signal(
+                    code=code,
+                    side=OrderSide.BUY,
+                    weight=1.0 / top_n,
+                    reason=f"评分={score:.2f}"
+                ))
+        
+        return signals
+    
+    def _should_exit(self, code: str, context: StrategyContext) -> bool:
+        """判断是否离场"""
+        rsrs = context.get_factor('rsrs', code)
+        threshold = self.get_param('exit_threshold')
+        
+        return rsrs is not None and rsrs < threshold
+    
+    def _select_candidates(self, context: StrategyContext) -> List[tuple]:
+        """筛选候选股"""
+        candidates = []
+        threshold = self.get_param('entry_threshold')
+        
+        for _, row in context.current_data.iterrows():
+            code = row['code']
+            rsrs = context.get_factor('rsrs', code)
+            momentum = context.get_factor('momentum', code)
+            
+            if rsrs is None or momentum is None:
+                continue
+            
+            # 入场条件
+            if rsrs > threshold and momentum > 0:
+                score = rsrs * 0.6 + momentum * 0.4
+                candidates.append((code, score))
+        
+        # 按评分排序
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        return candidates
+    
+    def on_order_filled(self, order) -> None:
+        """订单成交回调"""
+        self.logger.info(f"成交: {order.side} {order.code} @ {order.filled_price}")
+
+4.2 因子开发
+
+Python
+
+"""
+自定义因子示例
+"""
+import numpy as np
+import pandas as pd
+
+from factors.base import BaseFactor, FactorMeta, FactorRegistry
+
+
+@FactorRegistry.register
+class MyCustomFactor(BaseFactor):
+    """
+    自定义因子
+    
+    计算逻辑: ...
+    """
+    
+    meta = FactorMeta(
+        name="my_factor",
+        category="technical",
+        description="我的自定义因子",
+        lookback=30
+    )
+    
+    def __init__(self, window: int = 20, **kwargs):
+        super().__init__(**kwargs)
+        self.window = window
+        self.meta.lookback = window + 10
+    
+    def compute(self, df: pd.DataFrame) -> pd.Series:
+        """
+        计算因子值
+        
+        Args:
+            df: OHLCV 数据
+        
+        Returns:
+            因子值序列
+        """
+        close = df['close']
+        volume = df['vol']
+        
+        # 你的计算逻辑 (必须向量化)
+        result = close.rolling(self.window).mean() / close
+        
+        return result.rename(self.name)
+
+4.3 回测工作流
+
+Python
+
+"""
+完整回测工作流示例
+"""
+from engine import BacktestEngine
+from strategy import RSRSStrategy, MomentumStrategy
+from analysis import PerformanceAnalyzer, ReportGenerator
+
+# 1. 创建引擎
+engine = BacktestEngine(
+    db_path='stocks_daily.db',
+    initial_capital=1_000_000,
+    commission_rate=0.0003,
+    slippage_rate=0.001
+)
+
+# 2. 添加策略 (支持多策略对比)
+engine.add_strategy(RSRSStrategy(params={'top_n': 20}))
+engine.add_strategy(MomentumStrategy(params={'top_n': 20}))
+
+# 3. 运行回测
+results = engine.run(
+    start_date='2018-01-01',
+    end_date='2023-12-31',
+    rebalance_freq='W'  # 周度调仓
+)
+
+# 4. 分析结果
+for name, result in results.items():
+    ReportGenerator.print_backtest_summary(result.metrics, name)
+
+# 5. 对比净值曲线
+comparison = engine.compare_strategies()
+print(comparison.tail(10))
+
+# 6. 导出数据
+for name, result in results.items():
+    result.get_equity_curve().to_csv(f'{name}_equity.csv')
+    result.get_trades().to_csv(f'{name}_trades.csv')
+
+5. API 参考
+5.1 核心类一览
+模块	类	说明
+config	Settings	全局配置
+core	NodeScanner	TDX 节点扫描
+core	StockDownloader	数据下载器
+core	StockDatabase	DuckDB 数据库
+core	DataUpdater	数据更新调度
+factors	BaseFactor	因子基类
+factors	FactorRegistry	因子注册表
+factors	FactorPipeline	因子流水线
+strategy	BaseStrategy	策略基类
+strategy	StrategyRegistry	策略注册表
+strategy	Signal	交易信号
+engine	MatchEngine	撮合引擎
+engine	PortfolioManager	持仓管理
+engine	BacktestEngine	回测引擎
+analysis	MarketScanner	市场扫描
+analysis	StockDoctor	单股诊断
+analysis	PerformanceAnalyzer	绩效分析
+5.2 内置因子
+因子名	类	说明
+rsrs_slope	RSRSFactor	RSRS 原始斜率
+rsrs_zscore	RSRSZScoreFactor	RSRS 标准化 (R²加权)
+rsrs_valid	RSRSValidFactor	RSRS 有效性标记
+momentum	MomentumFactor	N日价格动量
+roc	ROCFactor	对数收益
+obv_trend	OBVTrendFactor	OBV 趋势方向
+vwap_bias	VWAPBiasFactor	VWAP 乖离率
+vol_rank	VolumeRankFactor	成交量分位
+atr	ATRFactor	平均真实波幅
+atr_pct	ATRPercentFactor	ATR 百分比
+volatility	VolatilityFactor	历史波动率
+chandelier_stop	ChandelierStopFactor	吊灯止损线
+vol_regime	VolatilityRegimeFactor	波动率状态
+alpha_score	AlphaScoreFactor	多因子综合评分
+5.3 CLI 命令
+
+Bash
+
+# 主命令
+python main.py --help
+
+# 子命令
+python main.py init --help      # 初始化数据库
+python main.py update --help    # 数据更新
+python main.py backtest --help  # 运行回测
+python main.py scan --help      # 市场扫描
+python main.py diagnose --help  # 单股诊断
+python main.py info             # 系统信息
+
+6. 最佳实践
+6.1 数据管理
+
+Python
+
+# ✅ 推荐: 增量更新
+python main.py update
+
+# ❌ 避免: 频繁全量更新
+python main.py update --full  # 仅在数据异常时使用
+
+# ✅ 推荐: 定时任务
+# crontab 示例: 每天 18:00 更新
+0 18 * * 1-5 cd /path/to/quant_engine && python main.py update
+
+6.2 因子开发
+
+Python
+
+# ✅ 推荐: 向量化计算
+def compute(self, df):
+    return df['close'].rolling(20).mean()
+
+# ❌ 避免: 循环遍历
+def compute(self, df):
+    result = []
+    for i in range(len(df)):
+        result.append(df['close'].iloc[max(0,i-20):i].mean())
+    return pd.Series(result)
+
+# ✅ 推荐: 使用 sliding_window_view
+from numpy.lib.stride_tricks import sliding_window_view
+windows = sliding_window_view(arr, window_size)
+
+# ✅ 推荐: 批量计算
+factor.compute_batch(stock_data)  # 一次计算多股
+
+# ❌ 避免: 逐股计算
+for code, df in stock_data.items():
+    results[code] = factor.compute(df)
+
+6.3 策略开发
+
+Python
+
+# ✅ 推荐: 参数化
+class MyStrategy(BaseStrategy):
+    def __init__(self, params=None):
+        default = {'top_n': 20, 'threshold': 0.7}
+        super().__init__({**default, **(params or {})})
+
+# ✅ 推荐: 分离入场/离场逻辑
+def generate_signals(self, context):
+    signals = []
+    signals.extend(self._exit_signals(context))   # 先卖
+    signals.extend(self._entry_signals(context))  # 后买
+    return signals
+
+# ✅ 推荐: 记录信号原因
+Signal(code='000001', side=OrderSide.BUY, reason=f"RSRS={rsrs:.2f}")
+
+# ❌ 避免: 硬编码
+Signal(code='000001', side=OrderSide.BUY, reason="买入")
+
+6.4 回测配置
+
+Python
+
+# ✅ 推荐: 合理的回测区间
+engine.run(start='2018-01-01', end='2023-12-31')  # 5年+
+
+# ❌ 避免: 过短区间
+engine.run(start='2023-01-01', end='2023-06-30')  # 半年不足
+
+# ✅ 推荐: 考虑交易成本
+BacktestEngine(commission_rate=0.0003, slippage_rate=0.001)
+
+# ❌ 避免: 忽略成本
+BacktestEngine(commission_rate=0, slippage_rate=0)
+
+# ✅ 推荐: 适当调仓频率
+engine.run(rebalance_freq='W')  # 周度
+
+# ❌ 避免: 过于频繁
+engine.run(rebalance_freq='D')  # 日度 (成本过高)
+
+6.5 内存管理
+
+Python
+
+# ✅ 推荐: 使用生成器
+for date, data in data_feeder:
+    process(data)
+
+# ✅ 推荐: 及时释放
+del large_dataframe
+import gc
+gc.collect()
+
+# ✅ 推荐: 使用 float32
+df = df.astype({'open': 'float32', 'close': 'float32'})
+
+# ✅ 推荐: 分块处理大数据
+for chunk in pd.read_sql(query, conn, chunksize=100000):
+    process(chunk)
+
+7. 专业建议
+7.1 策略开发建议
+避免过拟合
+
+text
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    过拟合检测清单                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ⚠️ 警惕信号:                                                  │
+│  • 参数过多 (>5个可调参数)                                     │
+│  • 回测夏普 > 3.0 (现实中罕见)                                 │
+│  • 样本内外表现差异 > 50%                                      │
+│  • 换手率过高 (>500% 年化)                                     │
+│                                                                 │
+│  ✅ 推荐做法:                                                   │
+│  • 参数稳健性测试 (参数变化 ±20%，结果变化 <30%)               │
+│  • 分段测试 (训练集/验证集/测试集 = 60/20/20)                  │
+│  • 模拟实盘测试 (纸面交易 3-6 个月)                            │
+│  • 多市场验证 (如有条件)                                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+参数选择原则
+参数	推荐范围	说明
+RSRS 窗口	16-20	太短噪音大，太长滞后
+标准化窗口	400-800	需覆盖完整牛熊周期
+R² 阈值	0.7-0.9	低则信号多但质量差
+选股数量	10-30	太少集中度高，太多分散
+调仓频率	周/双周	日度成本高，月度滞后
+策略组合建议
+
+Python
+
+# 推荐: 多策略组合
+portfolio_weights = {
+    'rsrs': 0.4,      # 趋势跟踪
+    'momentum': 0.3,  # 动量
+    'reversal': 0.3,  # 反转 (低相关)
+}
+
+# 动态权重调整 (高级)
+if market_regime == 'trending':
+    weights['rsrs'] = 0.5
+elif market_regime == 'ranging':
+    weights['reversal'] = 0.5
+
+7.2 风险管理建议
+仓位控制
+
+Python
+
+# 推荐: 波动率倒数加权
+def calculate_weights(stocks, volatilities):
+    inv_vol = 1 / volatilities
+    return inv_vol / inv_vol.sum()
+
+# 推荐: 最大单只权重限制
+MAX_SINGLE_WEIGHT = 0.10  # 单只不超过 10%
+
+# 推荐: 现金储备
+CASH_RESERVE = 0.05  # 保留 5% 现金
+
+止损策略
+
+Python
+
+# 推荐: 吊灯止损 (动态)
+stop_price = rolling_high - 3 * ATR
+
+# 推荐: 最大回撤止损
+if drawdown > 0.15:  # 回撤超 15%
+    reduce_position(0.5)
+
+# 推荐: 时间止损
+if holding_days > 60 and pnl < 0:
+    exit_position()
+
+7.3 运维建议
+监控清单
+
+YAML
+
+每日检查:
+  - [ ] 数据更新是否成功
+  - [ ] 是否有停牌股
+  - [ ] 信号生成是否正常
+  - [ ] 撮合是否有拒绝订单
+
+每周检查:
+  - [ ] 策略绩效回顾
+  - [ ] 持仓集中度
+  - [ ] 换手率统计
+
+每月检查:
+  - [ ] 参数有效性评估
+  - [ ] 因子衰减检测
+  - [ ] 风险指标审查
+
+日志分析
+
+Python
+
+# 重要日志关键词
+grep "REJECT" logs/quant_*.log   # 订单拒绝
+grep "ERROR" logs/quant_*.log    # 错误
+grep "WARNING" logs/quant_*.log  # 警告
+
+# 交易统计
+grep "MATCH" logs/quant_*.log | wc -l  # 成交数量
+
+7.4 扩展建议
+推荐扩展
+扩展	难度	收益	说明
+分钟级数据	中	高	支持日内策略
+实时行情	高	高	对接券商接口
+组合优化	中	中	均值方差/风险平价
+机器学习因子	高	中	XGBoost/LSTM
+Web 仪表盘	中	中	可视化监控
+微信/钉钉推送	低	中	信号提醒
+代码结构扩展
+
+text
+
+quant_engine/
+├── ...
+├── ml/                      # 机器学习扩展
+│   ├── features.py          # 特征工程
+│   ├── models.py            # 模型定义
+│   └── ensemble.py          # 集成方法
+├── live/                    # 实盘交易
+│   ├── broker.py            # 券商接口
+│   ├── order_manager.py     # 订单管理
+│   └── risk_monitor.py      # 风控监控
+└── web/                     # Web 界面
+    ├── app.py               # Flask/FastAPI
+    ├── templates/           # 模板
+    └── static/              # 静态文件
+
+8. 常见问题
+8.1 数据问题
+
+Q: 数据下载失败?
+
+Bash
+
+# 1. 检查网络
+ping 119.147.212.81
+
+# 2. 重新扫描节点
+python -c "from core import NodeScanner; print(NodeScanner().scan_fastest(5))"
+
+# 3. 手动指定节点 (修改 config/settings.py)
+
+Q: 数据缺失?
+
+Python
+
+# 检查完整性
+from core import DataUpdater
+updater = DataUpdater()
+report = updater.check_integrity()
+print(report)
+
+Q: 数据库文件过大?
+
+Python
+
+# 压缩数据库
+from core import StockDatabase
+db = StockDatabase()
+db.vacuum()  # 压缩
+
+8.2 策略问题
+
+Q: 回测结果为空?
+
+Python
+
+# 检查清单:
+# 1. 数据是否存在
+db.get_stats()
+
+# 2. 日期范围是否正确
+# 3. 因子计算是否成功
+# 4. 信号是否生成
+
+Q: 收益曲线异常?
+
+Python
+
+# 检查交易记录
+trades = result.get_trades()
+print(trades[trades['side'] == 'BUY'].head(20))
+
+# 检查是否有大量拒绝订单
+rejected = [o for o in portfolio.trade_history if o.status == OrderStatus.REJECTED]
+
+Q: 如何调试策略?
+
+Python
+
+# 设置详细日志
+from utils.logger import setup_logging
+setup_logging(level='DEBUG')
+
+# 在策略中添加日志
+self.logger.debug(f"候选股: {candidates}")
+self.logger.info(f"生成信号: {len(signals)}")
+
+8.3 性能问题
+
+Q: 回测太慢?
+
+Python
+
+# 1. 减少股票数量
+engine.run(codes=['000001', '600519', ...])  # 指定股票
+
+# 2. 使用更短的历史数据
+settings.strategy.MIN_TRADING_DAYS = 120  # 减少
+
+# 3. 增加调仓间隔
+engine.run(rebalance_freq='M')  # 月度
+
+Q: 内存不足?
+
+Python
+
+# 1. 分批处理
+for batch in np.array_split(stock_list, 10):
+    process(batch)
+
+# 2. 使用 float32
+df = df.astype('float32')
+
+# 3. 及时释放
+del df
+gc.collect()
+
+8.4 部署问题
+
+Q: 如何设置定时任务?
+
+Bash
+
+# Linux crontab
+crontab -e
+
+# 每天 18:00 更新数据
+0 18 * * 1-5 /path/to/venv/bin/python /path/to/quant_engine/main.py update
+
+# 每天 18:30 发送扫描报告
+30 18 * * 1-5 /path/to/venv/bin/python /path/to/quant_engine/main.py scan --output /tmp/golden.csv && mail -s "今日金股" you@email.com < /tmp/golden.csv
+
+Q: 如何后台运行?
+
+Bash
+
+# 使用 nohup
+nohup python main.py update &
+
+# 使用 screen
+screen -S quant
+python main.py update
+# Ctrl+A, D 分离
+
+# 使用 systemd (推荐)
+# /etc/systemd/system/quant-update.service
+[Unit]
+Description=Quant Engine Daily Update
+After=network.target
+
+[Service]
+Type=oneshot
+User=your_user
+WorkingDirectory=/path/to/quant_engine
+ExecStart=/path/to/venv/bin/python main.py update
+
+附录
+A. 性能基准
+操作	数据量	耗时	环境
+全市场加载	5000股×250天	~3s	8核 32GB
+RSRS 计算	5000股	~5s	并行
+全市场扫描	5000股	<60s	8核
+5年回测	单策略	~30s	-
+B. 版本历史
+版本	日期	变更
+1.0.0	2024-01	初始版本
+C. 许可证
+
+MIT License
+
+文档版本: 1.0.0
+最后更新: 2024-01
+维护者: Quant Engine Team

@@ -1,0 +1,213 @@
+# ============================================================================
+# 文件: engine/risk.py (扩展)
+# ============================================================================
+"""
+风控模块扩展 - Kelly 准则 & 行业限额
+"""
+
+class KellyPositionSizer:
+    """
+    Kelly 准则仓位计算器
+    
+    核心公式:
+        f* = (p × b - q) / b
+        
+    其中:
+        p = 胜率
+        q = 1 - p = 败率
+        b = 盈亏比 = 平均盈利 / 平均亏损
+        f* = 最优仓位比例
+    
+    实际应用:
+        position = f* × kelly_fraction (保守系数，通常 0.25-0.5)
+    """
+    
+    def __init__(
+        self,
+        lookback_trades: int = 20,
+        kelly_fraction: float = 0.5,
+        min_trades: int = 5,
+        min_position: float = 0.02,
+        max_position: float = 0.10
+    ):
+        self.lookback_trades = lookback_trades
+        self.kelly_fraction = kelly_fraction
+        self.min_trades = min_trades
+        self.min_position = min_position
+        self.max_position = max_position
+        
+        self.logger = logging.getLogger("KellyPositionSizer")
+    
+    def calculate(
+        self,
+        trade_history: List[TradeRecord],
+        total_equity: float
+    ) -> Tuple[float, Dict]:
+        """
+        计算 Kelly 最优仓位
+        
+        Args:
+            trade_history: 交易历史
+            total_equity: 总资金
+        
+        Returns:
+            (position_weight, stats)
+        """
+        # 取最近 N 笔
+        recent = trade_history[-self.lookback_trades:] if len(trade_history) >= self.min_trades else trade_history
+        
+        if len(recent) < self.min_trades:
+            return self.min_position, {'reason': 'insufficient_history'}
+        
+        # 计算统计
+        wins = [t for t in recent if t.is_win]
+        losses = [t for t in recent if not t.is_win]
+        
+        n_wins = len(wins)
+        n_losses = len(losses)
+        n_total = len(recent)
+        
+        if n_wins == 0 or n_losses == 0:
+            # 全胜或全败，使用默认
+            return self.min_position, {'reason': 'extreme_outcome'}
+        
+        # 胜率
+        p = n_wins / n_total
+        q = 1 - p
+        
+        # 盈亏比
+        avg_win = np.mean([t.pnl_ratio for t in wins])
+        avg_loss = abs(np.mean([t.pnl_ratio for t in losses]))
+        
+        if avg_loss <= 0:
+            return self.min_position, {'reason': 'zero_loss'}
+        
+        b = avg_win / avg_loss
+        
+        # Kelly 公式
+        kelly = (p * b - q) / b
+        
+        # 负值表示期望为负，不应交易
+        if kelly <= 0:
+            self.logger.warning(f"Kelly < 0 ({kelly:.2%})，策略期望为负")
+            return 0, {
+                'kelly': kelly,
+                'win_rate': p,
+                'profit_loss_ratio': b,
+                'reason': 'negative_expectancy'
+            }
+        
+        # 保守调整
+        adjusted = kelly * self.kelly_fraction
+        
+        # 限制范围
+        final = np.clip(adjusted, self.min_position, self.max_position)
+        
+        stats = {
+            'raw_kelly': kelly,
+            'adjusted_kelly': adjusted,
+            'final_position': final,
+            'win_rate': p,
+            'profit_loss_ratio': b,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'sample_size': n_total
+        }
+        
+        self.logger.info(
+            f"[KELLY] 胜率={p:.0%} 盈亏比={b:.2f} "
+            f"原始Kelly={kelly:.1%} → 调整后={final:.1%}"
+        )
+        
+        return final, stats
+
+
+class SectorExposureManager:
+    """
+    行业敞口管理器
+    
+    限制单一行业暴露不超过总资金的指定比例
+    """
+    
+    # 行业分类 (简化版，实际需要更完整的映射)
+    SECTOR_MAP = {
+        # 银行
+        '000001': 'bank', '600036': 'bank', '601398': 'bank',
+        # 白酒
+        '600519': 'liquor', '000858': 'liquor',
+        # 科技
+        '002415': 'tech', '300750': 'tech',
+        # ... 更多映射
+    }
+    
+    def __init__(
+        self,
+        max_sector_weight: float = 0.20,
+        sector_map: Dict[str, str] = None
+    ):
+        self.max_sector_weight = max_sector_weight
+        self.sector_map = sector_map or self.SECTOR_MAP
+        
+        self._current_exposure: Dict[str, float] = {}
+        
+        self.logger = logging.getLogger("SectorExposure")
+    
+    def get_sector(self, code: str) -> str:
+        """获取股票所属行业"""
+        return self.sector_map.get(code, 'other')
+    
+    def check_exposure(
+        self,
+        code: str,
+        proposed_weight: float,
+        current_positions: Dict[str, float]
+    ) -> Tuple[bool, float, str]:
+        """
+        检查行业敞口
+        
+        Args:
+            code: 股票代码
+            proposed_weight: 拟增加的权重
+            current_positions: 当前持仓权重 {code: weight}
+        
+        Returns:
+            (is_allowed, max_allowed_weight, reason)
+        """
+        sector = self.get_sector(code)
+        
+        # 计算当前行业敞口
+        current_sector_weight = sum(
+            weight for c, weight in current_positions.items()
+            if self.get_sector(c) == sector
+        )
+        
+        # 检查是否超限
+        if current_sector_weight + proposed_weight > self.max_sector_weight:
+            remaining = self.max_sector_weight - current_sector_weight
+            remaining = max(0, remaining)
+            
+            return (
+                remaining > 0,
+                remaining,
+                f"行业({sector})敞口将超限: 当前{current_sector_weight:.0%} + 新增{proposed_weight:.0%} > {self.max_sector_weight:.0%}"
+            )
+        
+        return True, proposed_weight, ""
+    
+    def update_exposure(self, positions: Dict[str, float]) -> Dict[str, float]:
+        """更新行业敞口"""
+        self._current_exposure = {}
+        
+        for code, weight in positions.items():
+            sector = self.get_sector(code)
+            self._current_exposure[sector] = self._current_exposure.get(sector, 0) + weight
+        
+        return self._current_exposure.copy()
+    
+    def get_report(self) -> str:
+        """获取行业敞口报告"""
+        lines = ["行业敞口报告:"]
+        for sector, weight in sorted(self._current_exposure.items(), key=lambda x: -x[1]):
+            status = "⚠️" if weight > self.max_sector_weight * 0.8 else "✓"
+            lines.append(f"  {status} {sector}: {weight:.1%}")
+        return "\n".join(lines)
