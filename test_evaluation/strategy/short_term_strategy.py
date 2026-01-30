@@ -255,9 +255,13 @@ class ShortTermRSRSStrategy(BaseStrategy):
         return signals
     
     def _screen_entry_candidates(self, context: StrategyContext) -> List[Dict]:
-        """筛选入场候选股"""
-        candidates = []
+        """筛选入场候选股 (向量化优化)"""
+        # 获取所有因子值 (向量化)
+        rsrs_score_series = context.get_all_factors('rsrs_score')
+        rsrs_r2_series = context.get_all_factors('rsrs_r2')
+        atr_pct_series = context.get_all_factors('atr_pct')
         
+        # 参数
         rsrs_threshold = self.get_param('rsrs_entry_threshold')
         r2_threshold = self.get_param('r2_threshold')
         vol_mult = self.get_param('volume_multiplier')
@@ -265,74 +269,66 @@ class ShortTermRSRSStrategy(BaseStrategy):
         max_price = self.get_param('max_price')
         min_volume = self.get_param('min_volume')
         
-        for _, row in context.current_data.iterrows():
-            code = row['code']
-            close = row['close']
-            volume = row.get('vol', row.get('volume', 0))
+        # 复制数据并添加因子
+        current_data = context.current_data.copy()
+        
+        if rsrs_score_series is not None:
+            current_data['rsrs_score'] = rsrs_score_series
+            current_data['rsrs_r2'] = rsrs_r2_series if rsrs_r2_series is not None else 0
+            current_data['atr_pct'] = atr_pct_series if atr_pct_series is not None else 0.02
+        
+        # 统一NaN处理 (向量化)
+        current_data = current_data.fillna({
+            'rsrs_r2': 0,
+            'atr_pct': 0.02
+        })
+        
+        # 计算均线和成交量指标 (向量化)
+        def calculate_ma_vol(group):
+            if len(group) < 20:
+                return pd.Series({
+                    'ma5': 0,
+                    'ma20': 0,
+                    'vol_ratio': 0,
+                    'vol_ma5': 0
+                })
             
-            # ===== 基础过滤 =====
-            # 跳过已持仓
-            if code in context.positions:
-                continue
+            ma5 = group['close'].tail(5).mean()
+            ma20 = group['close'].tail(20).mean()
+            vol_ma5 = group['vol'].tail(5).mean() if 'vol' in group.columns else 0
             
-            # 价格过滤
-            if close < min_price or close > max_price:
-                continue
-            
-            # 成交量过滤
-            if volume < min_volume:
-                continue
-            
-            # ===== 因子获取 =====
-            rsrs_score = context.get_factor('rsrs_score', code)
-            rsrs_r2 = context.get_factor('rsrs_r2', code)
-            atr_pct = context.get_factor('atr_pct', code)
-            
-            if rsrs_score is None or pd.isna(rsrs_score):
-                continue
-            
-            # ===== 条件1: RSRS 过滤 =====
-            if rsrs_score <= rsrs_threshold:
-                continue
-            
-            if rsrs_r2 is None or rsrs_r2 < r2_threshold:
-                continue
-            
-            # ===== 条件2: 均线趋势过滤 =====
-            history = context.get_history(code, 25)
-            if history.empty or len(history) < 20:
-                continue
-            
-            ma5 = history['close'].tail(5).mean()
-            ma20 = history['close'].tail(20).mean()
-            
-            if close <= ma5 or close <= ma20:
-                continue
-            
-            # ===== 条件3: 放量突破过滤 =====
-            vol_ma5 = history['vol'].tail(5).mean() if 'vol' in history.columns else 0
-            
-            if vol_ma5 <= 0:
-                continue
-            
-            vol_ratio = volume / vol_ma5
-            
-            if vol_ratio < vol_mult:
-                continue
-            
-            # ===== 通过所有条件 =====
-            candidates.append({
-                'code': code,
-                'close': close,
-                'volume': volume,
-                'rsrs_score': rsrs_score,
-                'rsrs_r2': rsrs_r2,
-                'atr_pct': atr_pct or 0.02,
+            return pd.Series({
                 'ma5': ma5,
                 'ma20': ma20,
-                'vol_ratio': vol_ratio,
-                'score': rsrs_score * rsrs_r2  # 综合评分
+                'vol_ratio': group['vol'].iloc[-1] / vol_ma5 if vol_ma5 > 0 else 0,
+                'vol_ma5': vol_ma5
             })
+        
+        # 按股票计算指标
+        indicators = current_data.groupby('code').apply(calculate_ma_vol)
+        current_data = current_data.merge(indicators, left_on='code', right_index=True)
+        
+        # 过滤条件 (向量化)
+        mask = (
+            (~current_data['code'].isin(context.positions.keys())) &  # 不在持仓中
+            (current_data['close'] >= min_price) &  # 价格过滤
+            (current_data['close'] <= max_price) &
+            (current_data['vol'] >= min_volume) &  # 成交量过滤
+            (current_data['rsrs_score'].notna()) &  # RSRS 过滤
+            (current_data['rsrs_score'] > rsrs_threshold) &
+            (current_data['rsrs_r2'] >= r2_threshold) &
+            (current_data['close'] > current_data['ma5']) &  # 均线趋势
+            (current_data['close'] > current_data['ma20']) &
+            (current_data['vol_ratio'] >= vol_mult)  # 放量突破
+        )
+        
+        filtered_data = current_data[mask].copy()
+        
+        # 计算综合评分
+        filtered_data['score'] = filtered_data['rsrs_score'] * filtered_data['rsrs_r2']
+        
+        # 转换为字典列表
+        candidates = filtered_data.to_dict('records')
         
         return candidates
     

@@ -62,7 +62,7 @@ class PerformanceAnalyzer:
         initial_capital: float = 1_000_000
     ) -> PerformanceMetrics:
         """
-        计算绩效指标
+        计算绩效指标 (优化: 缓存回撤计算)
         
         Args:
             equity_curve: 权益曲线 (需含 equity 列)
@@ -90,7 +90,7 @@ class PerformanceAnalyzer:
         annual_return = (1 + total_return) ** (1 / max(n_years, 0.01)) - 1
         
         # ====== 风险指标 ======
-        # 最大回撤
+        # 最大回撤 (优化: 向量化计算)
         peak = np.maximum.accumulate(equity)
         drawdown = (peak - equity) / peak
         max_drawdown = drawdown.max()

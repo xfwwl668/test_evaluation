@@ -427,82 +427,83 @@ class AlphaHunterStrategy(BaseStrategy):
         if len(self._positions) >= max_positions:
             return signals
         
-        candidates = []
+        # 筛选候选 (向量化)
+        current_data = context.current_data.copy()
         
-        for _, row in context.current_data.iterrows():
-            code = row['code']
-            close = row['close']
-            volume = row.get('vol', 0)
-            amount = row.get('amount', close * volume)
-            
-            # ===== 基础过滤 =====
-            if code in self._positions or code in context.positions:
-                continue
-            
-            if close < min_price or close > max_price:
-                continue
-            
-            if amount < min_volume:
-                continue
-            
-            # ===== 条件1: RSRS =====
-            rsrs = context.get_factor('rsrs_score', code)
-            r2 = context.get_factor('rsrs_r2', code)
-            
-            if rsrs is None or pd.isna(rsrs) or rsrs <= rsrs_th:
-                continue
-            
-            if r2 is None or pd.isna(r2) or r2 < r2_th:
-                continue
-            
-            # ===== 条件2: MA5 趋势 =====
-            ma5 = context.get_factor('ma5', code)
-            ma5_slope = context.get_factor('ma5_slope', code)
-            
-            if ma5 is None or close <= ma5:
-                continue
-            
-            if ma5_slope is None or ma5_slope < ma5_slope_th:
-                continue
-            
-            # ===== 条件3: 换手率 =====
-            # 估算换手率 (成交额/市值，简化)
-            history = context.get_history(code, 5)
-            if not history.empty:
-                avg_amount = history['amount'].mean() if 'amount' in history.columns else 0
-                est_market_cap = close * history['vol'].mean() * 100 if 'vol' in history.columns else 1e10
-                turnover = avg_amount / est_market_cap if est_market_cap > 0 else 0
-                
-                if turnover > max_turnover:
-                    continue
-            
-            # ===== 条件4: 压力距离 =====
-            pressure = context.get_factor('pressure_distance', code)
-            if pressure is not None and pressure < min_pressure:
-                continue
-            
-            # ===== 条件5: 非涨停 (默认不追) =====
-            if not self.get_param('allow_limit_up_chase'):
-                prev_close = history['close'].iloc[-1] if not history.empty else close * 0.95
-                if close >= prev_close * 1.095:
-                    continue
-            
-            # 通过所有条件
-            score = rsrs * r2
-            candidates.append({
-                'code': code,
-                'close': close,
-                'rsrs': rsrs,
-                'r2': r2,
-                'pressure': pressure or 0.1,
-                'score': score
-            })
+        # 获取所有因子值 (向量化)
+        rsrs_series = context.get_all_factors('rsrs_score')
+        r2_series = context.get_all_factors('rsrs_r2')
+        ma5_series = context.get_all_factors('ma5')
+        ma5_slope_series = context.get_all_factors('ma5_slope')
+        pressure_series = context.get_all_factors('pressure_distance')
         
-        # 排序选最强
-        candidates.sort(key=lambda x: x['score'], reverse=True)
+        # 合并到DataFrame (向量化)
+        if rsrs_series is not None:
+            current_data['rsrs'] = rsrs_series
+            current_data['r2'] = r2_series if r2_series is not None else 0
+            current_data['ma5'] = ma5_series if ma5_series is not None else 0
+            current_data['ma5_slope'] = ma5_slope_series if ma5_slope_series is not None else 0
+            current_data['pressure'] = pressure_series if pressure_series is not None else 0.1
+        
+        # 统一NaN处理 (向量化)
+        current_data = current_data.fillna({
+            'r2': 0,
+            'ma5': 0,
+            'ma5_slope': 0,
+            'pressure': 0.1
+        })
+        
+        # 计算换手率 (向量化)
+        def calculate_turnover(group):
+            if len(group) < 5:
+                return 0.0
+            avg_amount = group['amount'].mean() if 'amount' in group.columns else 0
+            est_market_cap = group['close'].iloc[-1] * group['vol'].mean() * 100 if 'vol' in group.columns else 1e10
+            return avg_amount / est_market_cap if est_market_cap > 0 else 0
+        
+        current_data['turnover'] = current_data.groupby('code').apply(calculate_turnover).droplevel(0)
+        
+        # 过滤条件 (向量化)
+        mask = (
+            (~current_data['code'].isin(self._positions.keys())) &  # 不在持仓中
+            (~current_data['code'].isin(context.positions.keys())) &
+            (current_data['close'] >= min_price) &  # 价格过滤
+            (current_data['close'] <= max_price) &
+            (current_data['amount'] >= min_volume) &  # 成交额过滤
+            (current_data['rsrs'] > rsrs_th) &  # RSRS 过滤
+            (current_data['r2'] >= r2_th) &
+            (current_data['close'] > current_data['ma5']) &  # MA5 趋势
+            (current_data['ma5_slope'] >= ma5_slope_th) &
+            (current_data['turnover'] <= max_turnover) &  # 换手率
+            (current_data['pressure'] >= min_pressure)  # 压力距离
+        )
+        
+        # 非涨停过滤
+        if not self.get_param('allow_limit_up_chase'):
+            # 计算涨停标志
+            history_data = {}
+            for code in current_data['code'].unique():
+                history = context.get_history(code, 2)
+                if not history.empty:
+                    history_data[code] = history['close'].iloc[-1]
+            
+            current_data['prev_close'] = current_data['code'].map(history_data)
+            current_data['prev_close'] = current_data['prev_close'].fillna(current_data['close'] * 0.95)
+            mask = mask & (current_data['close'] < current_data['prev_close'] * 1.095)
+        
+        filtered_data = current_data[mask].copy()
+        
+        # 计算综合评分
+        filtered_data['score'] = filtered_data['rsrs'] * filtered_data['r2']
+        
+        # 排序选最强 (向量化)
+        filtered_data = filtered_data.sort_values('score', ascending=False)
         
         slots = max_positions - len(self._positions)
-        selected = candidates[:slots]
+        selected_data = filtered_data.head(slots)
+        
+        # 转换为字典列表
+        candidates = selected_data.to_dict('records')
         
         # 计算仓位
         for cand in selected:

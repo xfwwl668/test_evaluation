@@ -81,38 +81,42 @@ class RSRSStrategy(BaseStrategy):
         signals = []
         current_date = context.current_date
         
-        # 1. 收集候选股票及其因子值
-        candidates = []
+        # 1. 收集候选股票及其因子值 (向量化)
+        current_data = context.current_data.copy()
         
-        for _, row in context.current_data.iterrows():
-            code = row['code']
-            close = row['close']
-            
-            # 获取因子值
-            rsrs = context.get_factor('rsrs_zscore', code)
-            rsrs_valid = context.get_factor('rsrs_valid', code)
-            vol_rank = context.get_factor('vol_rank', code)
-            obv_trend = context.get_factor('obv_trend', code)
-            vwap_bias = context.get_factor('vwap_bias', code)
-            chandelier = context.get_factor('chandelier_stop', code)
-            
-            # 跳过无效数据
-            if rsrs is None or pd.isna(rsrs):
-                continue
-            
-            candidates.append({
-                'code': code,
-                'close': close,
-                'rsrs': rsrs,
-                'rsrs_valid': rsrs_valid or 0,
-                'vol_rank': vol_rank or 0.5,
-                'obv_trend': obv_trend or 0,
-                'vwap_bias': vwap_bias or 0,
-                'chandelier': chandelier or 0
-            })
+        # 获取所有因子值 (向量化)
+        rsrs_series = context.get_all_factors('rsrs_zscore')
+        rsrs_valid_series = context.get_all_factors('rsrs_valid')
+        vol_rank_series = context.get_all_factors('vol_rank')
+        obv_trend_series = context.get_all_factors('obv_trend')
+        vwap_bias_series = context.get_all_factors('vwap_bias')
+        chandelier_series = context.get_all_factors('chandelier_stop')
         
-        if not candidates:
+        # 合并到DataFrame (向量化)
+        if rsrs_series is not None:
+            current_data['rsrs'] = rsrs_series
+            current_data['rsrs_valid'] = rsrs_valid_series if rsrs_valid_series is not None else 0
+            current_data['vol_rank'] = vol_rank_series if vol_rank_series is not None else 0.5
+            current_data['obv_trend'] = obv_trend_series if obv_trend_series is not None else 0
+            current_data['vwap_bias'] = vwap_bias_series if vwap_bias_series is not None else 0
+            current_data['chandelier'] = chandelier_series if chandelier_series is not None else 0
+        
+        # 统一NaN处理 (向量化)
+        current_data = current_data.fillna({
+            'vol_rank': 0.5,
+            'obv_trend': 0,
+            'vwap_bias': 0,
+            'chandelier': 0
+        })
+        
+        # 过滤无效数据 (向量化)
+        candidates_df = current_data[current_data['rsrs'].notna()].copy()
+        
+        if candidates_df.empty:
             return signals
+        
+        # 转换为字典列表 (用于后续处理)
+        candidates = candidates_df.to_dict('records')
         
         # 2. 生成卖出信号 (先卖后买)
         signals.extend(self._generate_exit_signals(context, candidates))

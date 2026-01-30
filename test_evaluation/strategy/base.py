@@ -67,6 +67,15 @@ class StrategyContext:
             return None
         return factor_df.loc[self.current_date, code]
     
+    def get_all_factors(self, name: str) -> Optional[pd.Series]:
+        """获取所有股票的指定因子值（向量化）"""
+        if name not in self.factors:
+            return None
+        factor_df = self.factors[name]
+        if self.current_date not in factor_df.index:
+            return None
+        return factor_df.loc[self.current_date]
+    
     def get_history(self, code: str, lookback: int = 250) -> pd.DataFrame:
         """获取股票历史数据"""
         if code not in self.history_data:
