@@ -109,14 +109,23 @@ class TestShortTermStrategy:
             entry_date='2024-01-01',
             quantity=100,
             highest_price=10.0,
+            highest_date='2024-01-01',
             stop_loss_price=9.7,
             trailing_stop_price=9.7,
             atr_at_entry=0.2
         )
         
         # 更新移动止盈
-        state.update_trailing_stop(11.0, 0.2, 2.0)
+        should_exit, _ = state.update_trailing_stop_from_ohlc(
+            high_price=11.0,
+            low_price=10.5,
+            close_price=10.8,
+            atr=0.2,
+            current_date='2024-01-02',
+            multiplier=2.0
+        )
         
+        assert should_exit is False
         assert state.highest_price == 11.0
         assert state.trailing_stop_price > 9.7  # 止盈价上移
     
@@ -128,16 +137,100 @@ class TestShortTermStrategy:
             entry_date='2024-01-01',
             quantity=100,
             highest_price=12.0,
+            highest_date='2024-01-01',
             stop_loss_price=9.7,
             trailing_stop_price=11.0,
             atr_at_entry=0.2
         )
         
         # 价格回落
-        state.update_trailing_stop(11.5, 0.2, 2.0)
+        should_exit, _ = state.update_trailing_stop_from_ohlc(
+            high_price=11.5,
+            low_price=11.0,
+            close_price=11.2,
+            atr=0.2,
+            current_date='2024-01-02',
+            multiplier=2.0
+        )
         
+        assert should_exit is False
         # 止盈价不应下移
         assert state.trailing_stop_price >= 11.0
+
+    def test_no_look_ahead_bias(self):
+        """测试更新最高价不依赖收盘价"""
+        state = PositionState(
+            code='000001',
+            entry_price=10.0,
+            entry_date='2024-01-01',
+            quantity=100,
+            highest_price=10.5,
+            highest_date='2024-01-01',
+            stop_loss_price=9.7,
+            trailing_stop_price=9.7,
+            atr_at_entry=0.2
+        )
+
+        should_exit, _ = state.update_trailing_stop_from_ohlc(
+            high_price=10.4,
+            low_price=10.1,
+            close_price=10.8,
+            atr=0.2,
+            current_date='2024-01-02'
+        )
+
+        assert should_exit is False
+        assert state.highest_price == 10.5
+
+
+    def test_trailing_stop_edge_cases(self):
+        """测试移动止盈边界情况"""
+        state = PositionState(
+            code='000001',
+            entry_price=100.0,
+            entry_date='2024-01-01',
+            quantity=100,
+            highest_price=100.0,
+            highest_date='2024-01-01',
+            stop_loss_price=97.0,
+            trailing_stop_price=97.0,
+            atr_at_entry=2.0
+        )
+
+        should_exit, _ = state.update_trailing_stop_from_ohlc(
+            high_price=105.0,
+            low_price=104.0,
+            close_price=104.5,
+            atr=2.0,
+            current_date='2024-01-02'
+        )
+
+        assert should_exit is False
+        assert state.highest_price == 105.0
+        assert state.trailing_stop_price == pytest.approx(101.0)
+
+        should_exit, reason = state.update_trailing_stop_from_ohlc(
+            high_price=104.0,
+            low_price=96.0,
+            close_price=96.5,
+            atr=2.0,
+            current_date='2024-01-03'
+        )
+
+        assert should_exit is True
+        assert '固定止损' in reason
+
+        state.trailing_stop_price = 102.0
+        should_exit, reason = state.update_trailing_stop_from_ohlc(
+            high_price=103.0,
+            low_price=101.0,
+            close_price=101.5,
+            atr=2.0,
+            current_date='2024-01-04'
+        )
+
+        assert should_exit is True
+        assert '移动止盈' in reason
 
 
 class TestPositionSizer:

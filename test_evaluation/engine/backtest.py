@@ -286,10 +286,13 @@ class BacktestEngine:
             if code_data.empty:
                 continue
             
+            bar = code_data.iloc[0][['open', 'high', 'low', 'close', 'is_limit_up', 'is_limit_down']].copy()
+            if bar.isna().any():
+                bar = code_data.iloc[0]
             position = portfolio.get_position(order.code)
             
             matched = self.match_engine.match(
-                order, code_data.iloc[0], position, current_date
+                order, bar, position, current_date
             )
             
             if matched.status == OrderStatus.FILLED:
