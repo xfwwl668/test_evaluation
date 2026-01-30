@@ -72,37 +72,39 @@ class MomentumStrategy(BaseStrategy):
         max_vol = self.get_param('max_volatility')
         use_vol_weight = self.get_param('use_volatility_weight')
         
-        # 收集候选
-        candidates = []
+        # 收集候选 (向量化)
+        current_data = context.current_data.copy()
         
-        for _, row in context.current_data.iterrows():
-            code = row['code']
-            
-            mom = context.get_factor('momentum', code)
-            vol = context.get_factor('volatility', code)
-            atr_pct = context.get_factor('atr_pct', code)
-            
-            if mom is None or pd.isna(mom):
-                continue
-            
-            # 过滤条件
-            if mom < min_mom:
-                continue
-            
-            if vol is not None and vol > max_vol:
-                continue
-            
-            candidates.append({
-                'code': code,
-                'close': row['close'],
-                'momentum': mom,
-                'volatility': vol or 0.3,
-                'atr_pct': atr_pct or 0.02
-            })
+        # 获取所有因子值 (向量化)
+        mom_series = context.get_all_factors('momentum')
+        vol_series = context.get_all_factors('volatility')
+        atr_pct_series = context.get_all_factors('atr_pct')
         
-        # 排序选 Top N
-        candidates.sort(key=lambda x: x['momentum'], reverse=True)
-        selected = candidates[:top_n]
+        # 合并到DataFrame (向量化)
+        if mom_series is not None:
+            current_data['momentum'] = mom_series
+            current_data['volatility'] = vol_series if vol_series is not None else 0.3
+            current_data['atr_pct'] = atr_pct_series if atr_pct_series is not None else 0.02
+        
+        # 统一NaN处理 (向量化)
+        current_data = current_data.fillna({
+            'volatility': 0.3,
+            'atr_pct': 0.02
+        })
+        
+        # 过滤条件 (向量化)
+        candidates_df = current_data[
+            (current_data['momentum'].notna()) &
+            (current_data['momentum'] >= min_mom) &
+            (current_data['volatility'] <= max_vol)
+        ].copy()
+        
+        # 排序选 Top N (向量化)
+        candidates_df = candidates_df.sort_values('momentum', ascending=False).head(top_n)
+        
+        # 转换为字典列表
+        candidates = candidates_df.to_dict('records')
+        selected = candidates
         
         # 计算权重
         if use_vol_weight and selected:

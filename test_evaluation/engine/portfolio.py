@@ -93,6 +93,8 @@ class PortfolioManager:
         self.trade_history: List[Order] = []
         
         self._peak_equity = self.initial_capital
+        self._last_equity = self.initial_capital  # 缓存上次权益值
+        self._cached_drawdown = 0.0  # 缓存回撤值
         
         self.logger = logging.getLogger("Portfolio")
     
@@ -120,10 +122,18 @@ class PortfolioManager:
     
     @property
     def current_drawdown(self) -> float:
-        """当前回撤"""
-        if self._peak_equity <= 0:
-            return 0.0
-        return (self._peak_equity - self.total_equity) / self._peak_equity
+        """当前回撤 (优化: 缓存计算)"""
+        current_equity = self.total_equity
+        
+        # 只有在权益变化时重新计算
+        if current_equity != self._last_equity:
+            if self._peak_equity <= 0:
+                self._cached_drawdown = 0.0
+            else:
+                self._cached_drawdown = (self._peak_equity - current_equity) / self._peak_equity
+            self._last_equity = current_equity
+        
+        return self._cached_drawdown
     
     # ==================== 查询方法 ====================
     
@@ -149,9 +159,11 @@ class PortfolioManager:
     # ==================== 更新方法 ====================
     
     def update_market_value(self, market_data: pd.DataFrame) -> None:
-        """更新持仓市值"""
+        """更新持仓市值 (向量化)"""
+        # 创建价格映射 (向量化)
         price_map = dict(zip(market_data['code'], market_data['close']))
         
+        # 批量更新持仓市值
         for code, pos in self.positions.items():
             if code in price_map:
                 pos.update_market_value(price_map[code])
@@ -206,7 +218,7 @@ class PortfolioManager:
             del self.positions[code]
     
     def record_snapshot(self, current_date: str) -> None:
-        """记录权益快照"""
+        """记录权益快照 (优化: 更新缓存)"""
         equity = self.total_equity
         
         # 更新峰值
@@ -219,6 +231,9 @@ class PortfolioManager:
             prev_equity = self.equity_curve[-1].total_equity
             if prev_equity > 0:
                 daily_return = (equity - prev_equity) / prev_equity
+        
+        # 更新缓存
+        self._last_equity = equity
         
         snapshot = EquitySnapshot(
             date=current_date,

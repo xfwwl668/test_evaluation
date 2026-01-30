@@ -235,12 +235,15 @@ class BacktestEngine:
         portfolio: PortfolioManager,
         strategy: BaseStrategy
     ) -> StrategyContext:
-        """构建策略上下文"""
-        # 获取历史数据
+        """构建策略上下文 (优化历史数据获取)"""
+        # 获取历史数据 (优化: 只获取当前日期之前的数据)
         history = {}
-        for code in current_data['code'].unique():
+        codes_to_fetch = current_data['code'].unique()
+        
+        for code in codes_to_fetch:
             if code in self._data_cache:
                 hist = self._data_cache[code]
+                # 使用索引切片直接获取最近250个交易日数据
                 history[code] = hist[hist.index <= current_date].tail(250)
         
         # 持仓转换
