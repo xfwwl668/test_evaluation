@@ -9,6 +9,10 @@ Alpha-Hunter-V1 综合因子模块
 2. 开盘异动因子 (早盘放量捕捉)
 3. 压力位因子 (筹码密集区 + 历史高点)
 4. 市场情绪因子 (涨跌家数比)
+
+改进:
+- 集成NaNHandler进行数据验证
+- 安全的NaN处理
 """
 import numpy as np
 import pandas as pd
@@ -17,8 +21,9 @@ from scipy import stats
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
+import logging
 
-from ..base import BaseFactor, FactorMeta, FactorRegistry
+from factors.base import BaseFactor, FactorMeta, FactorRegistry
 from config import settings
 
 
@@ -81,6 +86,7 @@ class AdvancedRSRSFactor(BaseFactor):
         self.r2_threshold = r2_threshold
         self.skew_penalty_factor = skew_penalty_factor
         self.outlier_std = outlier_std
+        self._logger = logging.getLogger("AdvancedRSRSFactor")
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """计算最终修正 RSRS 得分"""
@@ -89,7 +95,7 @@ class AdvancedRSRSFactor(BaseFactor):
     
     def compute_full(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        计算完整 RSRS 数据
+        计算完整 RSRS 数据 - 修复: 添加数据验证和NaN处理
         
         Returns:
             DataFrame with: rsrs_slope, rsrs_r2, rsrs_zscore, 
@@ -100,8 +106,21 @@ class AdvancedRSRSFactor(BaseFactor):
         if n < self.window + 60:
             return self._empty_result(df.index)
         
-        high = df['high'].to_numpy(dtype=np.float64)
-        low = df['low'].to_numpy(dtype=np.float64)
+        # 数据验证
+        from utils.nan_handler import NaNHandler
+        code = getattr(df, 'name', '')
+        if not NaNHandler.validate_ohlcv(df, code):
+            self._logger.warning(f"[{code}] RSRS数据验证失败")
+            return self._empty_result(df.index)
+        
+        # 安全的NaN处理
+        high = NaNHandler.safe_fillna(
+            df['high'], method='interpolate', reason='RSRS-high', code=code
+        ).to_numpy(dtype=np.float64)
+        
+        low = NaNHandler.safe_fillna(
+            df['low'], method='interpolate', reason='RSRS-low', code=code
+        ).to_numpy(dtype=np.float64)
         
         # ===== Step 1: 滚动 OLS 回归 =====
         slope, r2, residual = self._vectorized_ols(high, low)
@@ -374,6 +393,7 @@ class PressureLevelFactor(BaseFactor):
         self.high_window = high_window
         self.volume_profile_bins = volume_profile_bins
         self.safe_distance = safe_distance
+        self._logger = logging.getLogger("PressureLevelFactor")
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """计算距离压力位的百分比"""
@@ -382,18 +402,36 @@ class PressureLevelFactor(BaseFactor):
     
     def compute_full(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        计算完整压力位数据
+        计算完整压力位数据 - 修复: 添加数据验证和NaN处理
         
         Returns:
             DataFrame with: pressure_20d, pressure_volume, 
                            pressure_round, distance_to_pressure, safe_score
         """
-        close = df['close'].to_numpy()
-        high = df['high'].to_numpy()
-        low = df['low'].to_numpy()
-        volume = df['vol'].to_numpy().astype(np.float64)
+        # 数据验证
+        from utils.nan_handler import NaNHandler
+        code = getattr(df, 'name', '')
+        if not NaNHandler.validate_ohlcv(df, code):
+            self._logger.warning(f"[{code}] 压力位数据验证失败")
+            return self._empty_result(df.index)
         
-        n = len(df)
+        # 安全的NaN处理
+        close = NaNHandler.safe_fillna(
+            df['close'], method='interpolate', reason='Pressure-close', code=code
+        ).to_numpy()
+        high = NaNHandler.safe_fillna(
+            df['high'], method='interpolate', reason='Pressure-high', code=code
+        ).to_numpy()
+        low = NaNHandler.safe_fillna(
+            df['low'], method='interpolate', reason='Pressure-low', code=code
+        ).to_numpy()
+        
+        volume_col = 'vol' if 'vol' in df.columns else 'volume'
+        volume = NaNHandler.safe_fillna(
+            df[volume_col], method='zero', reason='Pressure-volume', code=code
+        ).to_numpy().astype(np.float64)
+        
+        n = len(close)
         
         # ===== 1. 20日最高价压力 =====
         high_s = pd.Series(high, index=df.index)
@@ -543,6 +581,10 @@ class MarketBreadthFactor(BaseFactor):
     ):
         super().__init__(**kwargs)
         self.advance_threshold = advance_threshold
+    
+    def compute(self, df: pd.DataFrame) -> pd.Series:
+        """实现抽象方法 - 返回空序列(此因子用于市场广度计算，非单股票)"""
+        return pd.Series(np.nan, index=df.index, name=self.name)
     
     def compute_market_breadth(
         self,

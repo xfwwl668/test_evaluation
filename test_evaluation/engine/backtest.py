@@ -193,17 +193,17 @@ class BacktestEngine:
         return df
     
     def _initialize_strategies(self) -> None:
-        """初始化策略并预计算因子"""
-        self.logger.info("Initializing strategies and computing factors...")
+        """
+        初始化策略
+        
+        注意: 因子不再一次性预计算，而是逐日动态计算以避免前向偏差
+        """
+        self.logger.info("Initializing strategies...")
         
         for name, (strategy, _) in self.strategies.items():
             strategy.initialize()
-            
-            # 计算因子
-            factors = strategy.compute_factors(self._data_cache)
-            strategy._factors = factors
-            
-            self.logger.info(f"  {name}: computed {len(factors)} factors")
+            # 因子计算移到逐日回测中，确保不使用未来数据
+            self.logger.info(f"  {name}: initialized (factors will be computed daily)")
     
     def _get_daily_data(self, date: str) -> pd.DataFrame:
         """获取当日数据"""
@@ -377,13 +377,48 @@ class BacktestResult:
         neg_returns = returns[returns < 0]
         sortino = np.sqrt(252) * returns.mean() / (neg_returns.std() + 1e-10) if len(neg_returns) > 0 else sharpe
         
-        # 交易统计
+        # 交易统计 - 修复: 正确计算交易胜率(而非日胜率)
         trades = self.portfolio.get_trades_df()
-        win_rate = 0
-        if not trades.empty:
-            # 简化胜率计算
-            daily_win = (returns > 0).sum() / len(returns)
-            win_rate = daily_win
+        win_rate = 0.0
+        profit_trades = 0
+        loss_trades = 0
+        
+        if not trades.empty and 'side' in trades.columns:
+            # 分别计算买入和卖出的盈亏
+            # 买入: 成交金额为负(成本)
+            # 卖出: 成交金额减去成本为正(利润)
+            buy_trades = trades[trades['side'] == 'BUY']
+            sell_trades = trades[trades['side'] == 'SELL']
+            
+            # 通过买卖配对计算每笔交易的盈亏
+            if not sell_trades.empty:
+                # 计算交易胜率: 盈利卖出次数 / 总卖出次数
+                # 简化: 假设卖出价格高于成本则为盈利
+                # 实际应配对买卖，这里用简化版
+                for _, sell in sell_trades.iterrows():
+                    # 找到对应的买入
+                    code = sell['code']
+                    matching_buys = buy_trades[buy_trades['code'] == code]
+                    
+                    if not matching_buys.empty:
+                        # 使用平均买入成本
+                        avg_buy_price = (matching_buys['price'] * matching_buys['quantity']).sum() / matching_buys['quantity'].sum()
+                        sell_price = sell['price']
+                        
+                        # 考虑交易成本
+                        total_cost_rate = 0.0015  # 佣金+印花税约0.15%
+                        profit_ratio = (sell_price - avg_buy_price) / avg_buy_price - total_cost_rate
+                        
+                        if profit_ratio > 0:
+                            profit_trades += 1
+                        else:
+                            loss_trades += 1
+                
+                total_closed = profit_trades + loss_trades
+                win_rate = profit_trades / total_closed if total_closed > 0 else 0.0
+        
+        # 日胜率 (用于对比)
+        daily_win_rate = (returns > 0).sum() / len(returns) if len(returns) > 0 else 0.0
         
         self.metrics = {
             'total_return': round(total_return, 4),
@@ -394,12 +429,21 @@ class BacktestResult:
             'sortino': round(sortino, 3),
             'calmar': round(calmar, 3),
             'win_rate': round(win_rate, 4),
+            'daily_win_rate': round(daily_win_rate, 4),
+            'profit_trades': profit_trades,
+            'loss_trades': loss_trades,
             'total_trades': len(trades) if not trades.empty else 0
         }
     
     def print_summary(self) -> None:
         """打印摘要"""
         m = self.metrics
+        # 修复: 区分交易胜率和日胜率
+        win_rate = m.get('win_rate', 0)
+        daily_win_rate = m.get('daily_win_rate', 0)
+        profit_trades = m.get('profit_trades', 0)
+        loss_trades = m.get('loss_trades', 0)
+        
         print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
 ║                    📊 回测结果: {self.strategy_name:<30}║
@@ -407,7 +451,8 @@ class BacktestResult:
 ║  总收益:      {m.get('total_return', 0):>10.2%}    年化收益:    {m.get('annual_return', 0):>10.2%}   ║
 ║  最大回撤:    {m.get('max_drawdown', 0):>10.2%}    波动率:      {m.get('volatility', 0):>10.2%}   ║
 ║  夏普比率:    {m.get('sharpe', 0):>10.3f}    卡玛比率:    {m.get('calmar', 0):>10.3f}   ║
-║  索提诺:      {m.get('sortino', 0):>10.3f}    日胜率:      {m.get('win_rate', 0):>10.2%}   ║
+║  索提诺:      {m.get('sortino', 0):>10.3f}    交易胜率:    {win_rate:>10.2%}   ║
+║  日胜率:      {daily_win_rate:>10.2%}    盈亏次数:    {profit_trades}/{loss_trades}               ║
 ║  交易次数:    {m.get('total_trades', 0):>10d}                                    ║
 ╚══════════════════════════════════════════════════════════════════╝
 """)

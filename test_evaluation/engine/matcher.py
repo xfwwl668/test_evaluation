@@ -28,6 +28,9 @@ class Order:
     订单对象
     
     记录订单全生命周期
+    
+    改进:
+    - 添加filled_date字段用于T+1检查
     """
     order_id: str
     code: str
@@ -40,6 +43,7 @@ class Order:
     status: OrderStatus = OrderStatus.PENDING
     filled_price: float = 0.0
     filled_quantity: int = 0
+    filled_date: str = ""          # 实际成交日期(用于T+1检查)
     
     # 成本
     commission: float = 0.0
@@ -189,13 +193,15 @@ class MatchEngine:
         order.status = OrderStatus.FILLED
         order.filled_price = round(filled_price, 4)
         order.filled_quantity = order.quantity
+        order.filled_date = current_date  # 设置实际成交日期
         order.slippage = round(slippage * order.quantity, 2)
         order.commission = round(commission, 2)
         order.stamp_duty = round(stamp, 2)
         
         self.logger.debug(
             f"[MATCH] {order.side} {order.code} qty={order.quantity} "
-            f"@ {order.filled_price:.3f} cost={order.total_cost:.2f}"
+            f"@ {order.filled_price:.3f} cost={order.total_cost:.2f} "
+            f"date={current_date}"
         )
         
         return order
