@@ -56,18 +56,34 @@ class PositionState:
     entry_date: str
     quantity: int
     highest_price: float          # 持仓期间最高价 (用于移动止盈)
+    highest_date: str             # 最高价日期
     stop_loss_price: float        # 止损价
     trailing_stop_price: float    # 移动止盈价
     atr_at_entry: float           # 入场时的 ATR
     
-    def update_trailing_stop(self, current_price: float, atr: float, multiplier: float = 2.0):
-        """更新移动止盈价"""
-        if current_price > self.highest_price:
-            self.highest_price = current_price
-            # 新止盈价 = 最高价 - ATR × 倍数
-            new_stop = current_price - atr * multiplier
-            # 只能上移，不能下移
+    def update_trailing_stop_from_ohlc(
+        self,
+        high_price: float,
+        low_price: float,
+        close_price: float,
+        atr: float,
+        current_date: str,
+        multiplier: float = 2.0
+    ) -> Tuple[bool, str]:
+        """从 OHLC 更新移动止盈 (避免使用未来的收盘价)"""
+        if high_price > self.highest_price:
+            self.highest_price = high_price
+            self.highest_date = current_date
+            new_stop = high_price - atr * multiplier
             self.trailing_stop_price = max(self.trailing_stop_price, new_stop)
+
+        if close_price < self.trailing_stop_price:
+            return True, f"移动止盈 ({self.trailing_stop_price:.2f})"
+
+        if low_price < self.stop_loss_price:
+            return True, f"固定止损 ({self.stop_loss_price:.2f})"
+
+        return False, ""
 
 
 @StrategyRegistry.register
@@ -351,6 +367,8 @@ class ShortTermRSRSStrategy(BaseStrategy):
                 continue
             
             current_price = current_row['close'].iloc[0]
+            high_price = current_row['high'].iloc[0] if 'high' in current_row.columns else current_price
+            low_price = current_row['low'].iloc[0] if 'low' in current_row.columns else current_price
             
             # 获取持仓状态
             state = self._position_states.get(code)
@@ -366,7 +384,8 @@ class ShortTermRSRSStrategy(BaseStrategy):
                     entry_price=current_price,
                     entry_date=current_date,
                     quantity=quantity,
-                    highest_price=current_price,
+                    highest_price=high_price,
+                    highest_date=current_date,
                     stop_loss_price=current_price * (1 - fixed_stop),
                     trailing_stop_price=current_price * (1 - fixed_stop),
                     atr_at_entry=atr_pct * current_price
@@ -400,11 +419,14 @@ class ShortTermRSRSStrategy(BaseStrategy):
             # ===== 检查3: ATR 移动止盈 =====
             if not should_exit:
                 atr = (context.get_factor('atr_pct', code) or 0.02) * current_price
-                state.update_trailing_stop(current_price, atr, atr_mult)
-                
-                if current_price < state.trailing_stop_price:
-                    should_exit = True
-                    exit_reason = f"移动止盈 ({state.trailing_stop_price:.2f})"
+                should_exit, exit_reason = state.update_trailing_stop_from_ohlc(
+                    high_price=high_price,
+                    low_price=low_price,
+                    close_price=current_price,
+                    atr=atr,
+                    current_date=current_date,
+                    multiplier=atr_mult
+                )
             
             # ===== 检查4: 时间止损 =====
             if not should_exit:
@@ -494,6 +516,7 @@ class ShortTermRSRSStrategy(BaseStrategy):
                 entry_date=order.create_date,
                 quantity=order.filled_quantity,
                 highest_price=order.filled_price,
+                highest_date=order.create_date,
                 stop_loss_price=order.filled_price * (1 - fixed_stop),
                 trailing_stop_price=order.filled_price * (1 - fixed_stop),
                 atr_at_entry=atr
