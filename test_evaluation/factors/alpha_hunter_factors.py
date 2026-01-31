@@ -166,7 +166,12 @@ class AdvancedRSRSFactor(BaseFactor):
         final_score = np.where(valid, score_skew_adj, score_skew_adj * 0.3)
         
         # ===== Step 7: 斜率动量 (加速度) =====
-        slope_momentum = np.gradient(np.nan_to_num(slope_full, 0))
+        # 🔴 修复 Problem 12: 避免 np.nan_to_num(0) 带来的虚假动量
+        slope_momentum = np.full_like(slope_full, np.nan)
+        valid_mask = ~np.isnan(slope_full)
+        if valid_mask.sum() > 2:
+            # 只在有效数据上计算梯度
+            slope_momentum[valid_mask] = np.gradient(slope_full[valid_mask])
         
         return pd.DataFrame({
             'rsrs_slope': slope_full,

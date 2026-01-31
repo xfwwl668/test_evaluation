@@ -12,34 +12,16 @@ import logging
 
 from .matcher import MatchEngine, Order, OrderStatus
 from .portfolio import PortfolioManager, Position
+from .risk_manager import RiskManager
 from strategy import BaseStrategy, StrategyContext, Signal, OrderSide
 from core.database import StockDatabase
+from core.data_validator import DataValidator
 from config import settings
 
 
 class BacktestEngine:
     """
     回测引擎 - 策略评测核心
-    
-    架构:
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │                         BacktestEngine                              │
-    │                                                                     │
-    │  ┌───────────────┐     ┌───────────────┐     ┌─────────────────┐   │
-    │  │  DataLoader   │────►│   Strategy    │────►│  MatchEngine    │   │
-    │  │  时间步数据    │     │   信号生成    │     │  订单撮合       │   │
-    │  └───────────────┘     └───────────────┘     └────────┬────────┘   │
-    │         │                                              │            │
-    │         │              ┌───────────────┐               │            │
-    │         └─────────────►│  Portfolio    │◄──────────────┘            │
-    │                        │  持仓/权益    │                            │
-    │                        └───────┬───────┘                            │
-    │                                │                                    │
-    │                        ┌───────▼───────┐                            │
-    │                        │  Analyzer     │                            │
-    │                        │  绩效分析     │                            │
-    │                        └───────────────┘                            │
-    └─────────────────────────────────────────────────────────────────────┘
     """
     
     def __init__(
@@ -54,6 +36,8 @@ class BacktestEngine:
         
         # 组件
         self.db = StockDatabase(self.db_path)
+        self.validator = DataValidator()
+        self.risk_manager = RiskManager()
         self.match_engine = MatchEngine(
             commission_rate=commission_rate,
             slippage_rate=slippage_rate
@@ -114,14 +98,47 @@ class BacktestEngine:
         
         for i, current_date in enumerate(self.trading_dates):
             current_data = self._get_daily_data(current_date)
+            
+            # 数据质量检查
+            if i % 100 == 0:
+                self.validator.generate_quality_report(current_data)
+                
             is_rebalance = current_date in rebalance_dates
             
             for name, (strategy, portfolio) in self.strategies.items():
                 # 更新市值
                 portfolio.update_market_value(current_data)
                 
+                # 🔴 修复 Problem 20: 长期停牌强制卖出
+                for code, pos in list(portfolio.positions.items()):
+                    if pos.suspension_days > 30:
+                        self.logger.warning(f"[SUSPEND-EXIT] {code} 停牌超过30天，强制清仓")
+                        # 模拟强制成交
+                        exit_price = pos.market_value / pos.quantity if pos.quantity > 0 else 0
+                        order = self.match_engine.create_order(
+                            code=code, side="SELL", price=exit_price,
+                            quantity=pos.quantity, create_date=current_date, signal_reason="长期停牌强制卖出"
+                        )
+                        order.status = OrderStatus.FILLED
+                        order.filled_price = exit_price
+                        order.filled_quantity = pos.quantity
+                        order.filled_date = current_date
+                        portfolio.apply_order(order, current_date)
+                
+                # 🔴 修复 Problem 10: 风险管理
+                if not self.risk_manager.check_portfolio_risk({
+                    'drawdown': portfolio.current_drawdown,
+                    'total_equity': portfolio.total_equity
+                }):
+                    self.logger.critical(f"[{name}] 触发全局风控，停止该策略调仓")
+                    continue
+                
                 # 调仓日生成信号
                 if is_rebalance:
+                    # 🔴 修复 Problem 1: 逐日动态计算因子，确保无前向偏差
+                    history_for_factors = self._get_history_for_factors(current_date)
+                    strategy._factors = strategy.compute_factors(history_for_factors)
+                    
                     context = self._build_context(current_date, current_data, portfolio, strategy)
                     signals = strategy.generate_signals(context)
                     
@@ -164,6 +181,10 @@ class BacktestEngine:
         else:
             self._market_data = self.db.get_market_snapshot(end_date)  # 简化处理
         
+        # 🔴 修复 Problem 5: 数据质量验证
+        if not self.validator.validate_ohlcv(self._market_data, "MarketData"):
+            self.logger.warning("Market data validation failed, but proceeding with caution...")
+            
         # 计算涨跌停
         self._market_data = self._add_limit_flags(self._market_data)
         
@@ -181,6 +202,17 @@ class BacktestEngine:
             ].copy().set_index('date')
         
         self.logger.info(f"Loaded {len(self._data_cache)} stocks, {len(self.trading_dates)} trading days")
+
+    def _get_history_for_factors(self, current_date: str) -> Dict[str, pd.DataFrame]:
+        """获取用于因子计算的历史数据 (确保无前向偏差)"""
+        history = {}
+        for code, cache in self._data_cache.items():
+            # 只取 current_date 之前的数据
+            # 严格排除当日数据，因为因子计算通常基于历史
+            mask = cache.index < current_date
+            if mask.any():
+                history[code] = cache[mask].tail(250)
+        return history
     
     def _add_limit_flags(self, df: pd.DataFrame) -> pd.DataFrame:
         """添加涨跌停标记"""
@@ -382,40 +414,66 @@ class BacktestResult:
         win_rate = 0.0
         profit_trades = 0
         loss_trades = 0
+        profit_factor = 0.0
+        total_profit = 0.0
+        total_loss = 0.0
         
         if not trades.empty and 'side' in trades.columns:
-            # 分别计算买入和卖出的盈亏
-            # 买入: 成交金额为负(成本)
-            # 卖出: 成交金额减去成本为正(利润)
-            buy_trades = trades[trades['side'] == 'BUY']
-            sell_trades = trades[trades['side'] == 'SELL']
+            # 🔴 修复 Problem 4: 配对交易计算
+            # 记录每只股票的买入队列
+            buy_queues = {} # {code: [(qty, price)]}
             
-            # 通过买卖配对计算每笔交易的盈亏
-            if not sell_trades.empty:
-                # 计算交易胜率: 盈利卖出次数 / 总卖出次数
-                # 简化: 假设卖出价格高于成本则为盈利
-                # 实际应配对买卖，这里用简化版
-                for _, sell in sell_trades.iterrows():
-                    # 找到对应的买入
-                    code = sell['code']
-                    matching_buys = buy_trades[buy_trades['code'] == code]
-                    
-                    if not matching_buys.empty:
-                        # 使用平均买入成本
-                        avg_buy_price = (matching_buys['price'] * matching_buys['quantity']).sum() / matching_buys['quantity'].sum()
-                        sell_price = sell['price']
-                        
-                        # 考虑交易成本
-                        total_cost_rate = 0.0015  # 佣金+印花税约0.15%
-                        profit_ratio = (sell_price - avg_buy_price) / avg_buy_price - total_cost_rate
-                        
-                        if profit_ratio > 0:
-                            profit_trades += 1
-                        else:
-                            loss_trades += 1
+            # 按时间排序
+            trades_sorted = trades.sort_values('date')
+            
+            for _, trade in trades_sorted.iterrows():
+                code = trade['code']
+                qty = trade['quantity']
+                price = trade['price']
                 
-                total_closed = profit_trades + loss_trades
-                win_rate = profit_trades / total_closed if total_closed > 0 else 0.0
+                if trade['side'] == 'BUY':
+                    if code not in buy_queues:
+                        buy_queues[code] = []
+                    buy_queues[code].append({'qty': qty, 'price': price})
+                else:
+                    # 卖出，配对买入
+                    if code in buy_queues and buy_queues[code]:
+                        matched_qty = 0
+                        matched_cost = 0.0
+                        
+                        to_sell = qty
+                        while to_sell > 0 and buy_queues[code]:
+                            buy = buy_queues[code][0]
+                            if buy['qty'] <= to_sell:
+                                # 全部吃掉这笔买入
+                                matched_qty += buy['qty']
+                                matched_cost += buy['qty'] * buy['price']
+                                to_sell -= buy['qty']
+                                buy_queues[code].pop(0)
+                            else:
+                                # 部分吃掉
+                                matched_qty += to_sell
+                                matched_cost += to_sell * buy['price']
+                                buy['qty'] -= to_sell
+                                to_sell = 0
+                        
+                        if matched_qty > 0:
+                            avg_buy_price = matched_cost / matched_qty
+                            sell_price = price
+                            
+                            # 考虑手续费 (大概 0.15%)
+                            pnl = (sell_price - avg_buy_price) * matched_qty - trade['total_cost']
+                            
+                            if pnl > 0:
+                                profit_trades += 1
+                                total_profit += pnl
+                            else:
+                                loss_trades += 1
+                                total_loss += abs(pnl)
+            
+            total_closed = profit_trades + loss_trades
+            win_rate = profit_trades / total_closed if total_closed > 0 else 0.0
+            profit_factor = total_profit / total_loss if total_loss > 0 else (float('inf') if total_profit > 0 else 0.0)
         
         # 日胜率 (用于对比)
         daily_win_rate = (returns > 0).sum() / len(returns) if len(returns) > 0 else 0.0
@@ -432,7 +490,8 @@ class BacktestResult:
             'daily_win_rate': round(daily_win_rate, 4),
             'profit_trades': profit_trades,
             'loss_trades': loss_trades,
-            'total_trades': len(trades) if not trades.empty else 0
+            'total_trades': len(trades) if not trades.empty else 0,
+            'profit_factor': round(profit_factor, 2) if profit_factor != float('inf') else "inf"
         }
     
     def print_summary(self) -> None:
@@ -443,6 +502,7 @@ class BacktestResult:
         daily_win_rate = m.get('daily_win_rate', 0)
         profit_trades = m.get('profit_trades', 0)
         loss_trades = m.get('loss_trades', 0)
+        profit_factor = m.get('profit_factor', 0)
         
         print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
@@ -453,7 +513,7 @@ class BacktestResult:
 ║  夏普比率:    {m.get('sharpe', 0):>10.3f}    卡玛比率:    {m.get('calmar', 0):>10.3f}   ║
 ║  索提诺:      {m.get('sortino', 0):>10.3f}    交易胜率:    {win_rate:>10.2%}   ║
 ║  日胜率:      {daily_win_rate:>10.2%}    盈亏次数:    {profit_trades}/{loss_trades}               ║
-║  交易次数:    {m.get('total_trades', 0):>10d}                                    ║
+║  利润因子:    {str(profit_factor):>10}    交易次数:    {m.get('total_trades', 0):>10d}   ║
 ╚══════════════════════════════════════════════════════════════════╝
 """)
     
