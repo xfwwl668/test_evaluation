@@ -3,12 +3,18 @@
 # ============================================================================
 """
 因子基类 - 所有因子的抽象接口
+
+改进:
+1. 集成NaN处理框架
+2. 前置数据验证
+3. 标准化填充方法
 """
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Union, Type
 from dataclasses import dataclass, field
 import pandas as pd
 import numpy as np
+import logging
 
 
 @dataclass
@@ -19,6 +25,7 @@ class FactorMeta:
     description: str = ""               # 描述
     lookback: int = 0                   # 所需历史数据长度
     dependencies: List[str] = field(default_factory=list)  # 依赖的其他因子
+    validate_input: bool = True         # 是否进行输入验证
 
 
 class BaseFactor(ABC):
@@ -28,6 +35,10 @@ class BaseFactor(ABC):
     所有因子必须继承此类并实现:
     - meta: 因子元信息
     - compute(): 计算因子值
+    
+    改进:
+    1. 自动数据验证 (如果meta.validate_input=True)
+    2. 标准化NaN处理
     
     使用示例:
     ```python
@@ -54,6 +65,7 @@ class BaseFactor(ABC):
         """
         self.params = params
         self._cache: Dict[str, pd.Series] = {}
+        self._logger = logging.getLogger(self.__class__.__name__)
     
     @property
     def name(self) -> str:
@@ -62,6 +74,22 @@ class BaseFactor(ABC):
     @property
     def lookback(self) -> int:
         return self.meta.lookback
+    
+    def _validate_input(self, df: pd.DataFrame) -> bool:
+        """
+        输入数据验证
+        
+        Returns:
+            bool: 数据是否有效
+        """
+        if not getattr(self.meta, 'validate_input', True):
+            return True
+        
+        # 延迟导入避免循环依赖
+        from utils.nan_handler import NaNHandler
+        
+        code = getattr(df, 'name', '')
+        return NaNHandler.validate_ohlcv(df, code)
     
     @abstractmethod
     def compute(self, df: pd.DataFrame) -> pd.Series:
@@ -75,6 +103,29 @@ class BaseFactor(ABC):
             pd.Series: 因子值序列，index 与 df 一致
         """
         pass
+    
+    def compute_safe(self, df: pd.DataFrame) -> pd.Series:
+        """
+        安全的因子计算 (带验证)
+        
+        Args:
+            df: OHLCV数据
+        
+        Returns:
+            pd.Series: 因子值序列，验证失败返回NaN序列
+        """
+        # 数据验证
+        if not self._validate_input(df):
+            self._logger.warning(f"数据验证失败，返回空结果")
+            return pd.Series(np.nan, index=df.index, name=self.name)
+        
+        # 执行计算
+        try:
+            result = self.compute(df)
+            return result
+        except Exception as e:
+            self._logger.error(f"因子计算异常: {e}")
+            return pd.Series(np.nan, index=df.index, name=self.name)
     
     def compute_batch(self, data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         """
