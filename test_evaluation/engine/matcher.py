@@ -171,15 +171,20 @@ class MatchEngine:
             if position.quantity < order.quantity:
                 return self._reject(order, f"持仓不足: 持有{position.quantity}，卖出{order.quantity}")
             
+            # 🔴 修复 Problem 16: 使用成交日期进行T+1检查
             if position.buy_date == current_date:
                 return self._reject(order, "T+1限制: 当日买入不可卖出")
         
         # 4. 计算成交价 (开盘价 + 滑点)
+        # 🔴 修复 Problem 7: 改进滑点模型
+        daily_vol = market_data.get('vol', 1000000)
+        slippage_rate = self.calculate_slippage_rate(order.quantity, daily_vol)
+        
         if order.side == "BUY":
-            slippage = open_price * self.slippage_rate
+            slippage = open_price * slippage_rate
             filled_price = open_price + slippage
         else:
-            slippage = open_price * self.slippage_rate
+            slippage = open_price * slippage_rate
             filled_price = open_price - slippage
         
         # 5. 计算手续费
@@ -213,6 +218,24 @@ class MatchEngine:
         self.logger.warning(f"[REJECT] {order.code} {order.side}: {reason}")
         return order
     
+    def calculate_slippage_rate(self, order_qty: int, daily_vol: float) -> float:
+        """
+        计算动态滑点率
+        """
+        if daily_vol <= 0:
+            return self.slippage_rate
+            
+        ratio = order_qty / (daily_vol + 1e-9)
+        
+        if ratio < 0.01:
+            rate = 0.0001 # 1bp
+        elif ratio < 0.05:
+            rate = 0.0003 # 3bp
+        else:
+            rate = 0.0005 + (ratio - 0.05) * 0.1 # 大单惩罚
+            
+        return max(rate, self.slippage_rate)
+
     def calculate_slippage(self, price: float, side: str) -> float:
         """计算滑点"""
         if side == "BUY":

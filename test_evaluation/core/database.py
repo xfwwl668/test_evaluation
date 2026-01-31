@@ -32,6 +32,7 @@ class StockDatabase:
             code    VARCHAR(10) NOT NULL,
             market  TINYINT NOT NULL,
             date    DATE NOT NULL,
+            name    VARCHAR(20),
             open    FLOAT,
             high    FLOAT,
             low     FLOAT,
@@ -69,10 +70,6 @@ class StockDatabase:
     def bulk_upsert(self, df: pd.DataFrame) -> int:
         """
         批量 UPSERT (INSERT OR REPLACE)
-        
-        DuckDB 最优写入路径:
-        1. register() 零拷贝注册 DataFrame
-        2. INSERT OR REPLACE INTO ... SELECT 批量写入
         """
         if df.empty:
             return 0
@@ -83,12 +80,14 @@ class StockDatabase:
             conn.register("_tmp_df", df)
             conn.execute(f"""
                 INSERT OR REPLACE INTO {self.TABLE}
-                SELECT code, market, date, open, high, low, close, vol, amount
+                SELECT code, market, date, name, open, high, low, close, vol, amount
                 FROM _tmp_df
             """)
             conn.unregister("_tmp_df")
         
         return len(df)
+    
+    upsert = bulk_upsert  # 🔴 别名，为了兼容 updater.py
 
     def bulk_upsert_appender(self, df: pd.DataFrame) -> int:
         """
@@ -283,7 +282,9 @@ class StockDatabase:
                 df['date'] = df['date'].dt.date
         
         # 列顺序
-        cols = ['code', 'market', 'date', 'open', 'high', 'low', 'close', 'vol', 'amount']
+        cols = ['code', 'market', 'date', 'name', 'open', 'high', 'low', 'close', 'vol', 'amount']
+        if 'name' not in df.columns:
+            df['name'] = ""
         return df[[c for c in cols if c in df.columns]]
 
 

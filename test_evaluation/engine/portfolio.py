@@ -29,6 +29,9 @@ class Position:
     market_value: float = 0.0       # 当前市值
     unrealized_pnl: float = 0.0     # 未实现盈亏
     
+    # 🔴 修复 Problem 20: 停牌追踪
+    suspension_days: int = 0         # 连续停牌天数
+    
     @property
     def cost_value(self) -> float:
         """成本价值"""
@@ -91,6 +94,9 @@ class PortfolioManager:
         self.positions: Dict[str, Position] = {}
         self.equity_curve: List[EquitySnapshot] = []
         self.trade_history: List[Order] = []
+        
+        # 🔴 修复 Problem 13: 舍入误差补偿
+        self.rounding_errors: Dict[str, float] = {} # {code: shares_diff}
         
         self._peak_equity = self.initial_capital
         self._last_equity = self.initial_capital  # 缓存上次权益值
@@ -167,6 +173,11 @@ class PortfolioManager:
         for code, pos in self.positions.items():
             if code in price_map:
                 pos.update_market_value(price_map[code])
+                pos.suspension_days = 0
+            else:
+                # 🔴 修复 Problem 20: 记录停牌天数
+                pos.suspension_days += 1
+                # 市值保持不变 (或者根据市场大盘波动调整，这里简单处理保持不变)
     
     def apply_order(self, order: Order, current_date: str) -> None:
         """应用已成交订单"""
@@ -280,7 +291,7 @@ class PortfolioManager:
             current_weight = self.get_weight(code)
             target_weight = target_weights.get(code, 0.0)
             
-            if target_weight < current_weight * 0.9:  # 需要减仓
+            if target_weight < current_weight * 0.95:  # 需要减仓
                 pos = self.positions[code]
                 
                 if code not in price_map:
@@ -292,12 +303,20 @@ class PortfolioManager:
                     # 清仓
                     sell_qty = pos.quantity
                     reason = "清仓"
+                    self.rounding_errors[code] = 0
                 else:
                     # 减仓
                     target_value = total_equity * target_weight
-                    current_value = pos.market_value
-                    sell_value = current_value - target_value
-                    sell_qty = int(sell_value / price / 100) * 100
+                    target_qty = target_value / price
+                    
+                    # 🔴 补偿之前的误差
+                    target_qty += self.rounding_errors.get(code, 0)
+                    
+                    diff_qty = pos.quantity - target_qty
+                    sell_qty = int(diff_qty / 100) * 100
+                    
+                    # 记录新误差
+                    self.rounding_errors[code] = diff_qty - sell_qty
                     reason = f"减仓 {current_weight:.1%}→{target_weight:.1%}"
                 
                 if sell_qty >= 100:
@@ -323,22 +342,29 @@ class PortfolioManager:
             
             current_weight = self.get_weight(code)
             
-            if target_weight > current_weight * 1.1:  # 需要加仓
+            if target_weight > current_weight * 1.05:  # 需要加仓
                 if code not in price_map:
                     continue
                 
                 price = price_map[code]
                 
                 target_value = total_equity * target_weight
-                current_value = self.positions[code].market_value if code in self.positions else 0
-                buy_value = target_value - current_value
+                target_qty = target_value / price
+                
+                # 🔴 补偿之前的误差
+                target_qty -= self.rounding_errors.get(code, 0)
+                
+                current_qty = self.positions[code].quantity if code in self.positions else 0
+                buy_qty = int((target_qty - current_qty) / 100) * 100
                 
                 # 检查现金
-                buy_value = min(buy_value, available_cash)
-                buy_qty = int(buy_value / price / 100) * 100
+                if buy_qty * price > available_cash:
+                    buy_qty = int(available_cash / price / 100) * 100
                 
                 if buy_qty >= 100:
                     available_cash -= buy_qty * price
+                    # 记录新误差
+                    self.rounding_errors[code] = buy_qty - (target_qty - current_qty)
                     
                     reason = f"{'加仓' if code in self.positions else '建仓'} →{target_weight:.1%}"
                     
