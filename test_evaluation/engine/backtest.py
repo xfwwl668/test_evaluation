@@ -17,6 +17,7 @@ from strategy import BaseStrategy, StrategyContext, Signal, OrderSide
 from core.database import StockDatabase
 from core.data_validator import DataValidator
 from config import settings
+from utils.trading_calendar import TradingCalendar
 
 
 class BacktestEngine:
@@ -42,6 +43,7 @@ class BacktestEngine:
             commission_rate=commission_rate,
             slippage_rate=slippage_rate
         )
+        self.calendar = TradingCalendar()
         
         # 策略容器 (支持多策略对比)
         self.strategies: Dict[str, Tuple[BaseStrategy, PortfolioManager]] = {}
@@ -106,6 +108,9 @@ class BacktestEngine:
             is_rebalance = current_date in rebalance_dates
             
             for name, (strategy, portfolio) in self.strategies.items():
+                # 🔴 修复 Problem 3: 处理 T+1 清算
+                portfolio.process_settlement(current_date, self.calendar)
+                
                 # 更新市值
                 portfolio.update_market_value(current_data)
                 
@@ -168,7 +173,7 @@ class BacktestEngine:
         return results
     
     def _load_data(self, start_date: str, end_date: str, codes: List[str]) -> None:
-        """加载数据"""
+        """加载数据 (集成交易日历校验)"""
         self.logger.info("Loading market data...")
         
         # 扩展开始日期 (需要历史数据计算因子)
@@ -188,12 +193,18 @@ class BacktestEngine:
         # 计算涨跌停
         self._market_data = self._add_limit_flags(self._market_data)
         
-        # 交易日列表 (只取回测区间)
+        # 交易日列表 (只取回测区间 + 过滤非交易日)
         all_dates = self._market_data['date'].unique()
-        self.trading_dates = sorted([
+        raw_dates = sorted([
             d for d in all_dates 
             if start_date <= str(d) <= end_date
         ])
+        
+        # 🔴 修复 Problem 1: 使用交易日历过滤非交易日
+        self.trading_dates = self.calendar.filter_trading_dates([str(d) for d in raw_dates])
+        
+        if len(self.trading_dates) < len(raw_dates):
+            self.logger.info(f"Filtered {len(raw_dates) - len(self.trading_dates)} non-trading days")
         
         # 按股票缓存历史数据
         for code in self._market_data['code'].unique():
@@ -242,7 +253,7 @@ class BacktestEngine:
         return self._market_data[self._market_data['date'] == date].copy()
     
     def _get_rebalance_dates(self, freq: str) -> set:
-        """获取调仓日期"""
+        """获取调仓日期 (验证为交易日)"""
         dates = pd.to_datetime(self.trading_dates)
         
         if freq == 'D':
@@ -258,7 +269,15 @@ class BacktestEngine:
             return set(self.trading_dates)
         
         last_dates = df.groupby('period')['date'].last()
-        return set(last_dates.dt.strftime('%Y-%m-%d').tolist())
+        rebalance_dates = last_dates.dt.strftime('%Y-%m-%d').tolist()
+        
+        # 验证调仓日都是交易日
+        valid_dates, invalid_dates = self.calendar.validate_rebalance_dates(rebalance_dates)
+        
+        if invalid_dates:
+            self.logger.warning(f"Found {len(invalid_dates)} non-trading rebalance dates: {invalid_dates}")
+        
+        return set(valid_dates)
     
     def _build_context(
         self,
