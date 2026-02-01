@@ -25,12 +25,35 @@ import logging
 
 from .base import BaseStrategy, Signal, OrderSide, StrategyContext
 from .registry import StrategyRegistry
-from factors.alpha_hunter_factors import (
-    AlphaHunterFactorEngine, AlphaSignal, SignalStrength,
-    AdvancedRSRSFactor, PressureLevelFactor, MarketBreadthFactor
-)
-from engine.high_freq_matcher import HighFreqMatcher, MarketMicrostructure
-from engine.risk import RiskManager
+# Safe imports with fallback
+try:
+    from factors.alpha_hunter_factors import (
+        AlphaHunterFactorEngine, AlphaSignal, SignalStrength,
+        AdvancedRSRSFactor, PressureLevelFactor, MarketBreadthFactor
+    )
+    FACTOR_ENGINE_AVAILABLE = True
+except ImportError as e:
+    import logging
+    logger = logging.getLogger("AlphaHunterStrategy")
+    logger.warning(f"AlphaHunterFactorEngine 导入失败，将使用简化版本: {e}")
+    FACTOR_ENGINE_AVAILABLE = False
+    # Fallback imports for basic functionality
+    AlphaSignal = None
+    SignalStrength = None
+    AdvancedRSRSFactor = None
+    PressureLevelFactor = None
+    MarketBreadthFactor = None
+
+try:
+    from engine.high_freq_matcher import HighFreqMatcher, MarketMicrostructure
+except ImportError:
+    from engine.matcher import MatchEngine as HighFreqMatcher
+    MarketMicrostructure = None
+    import logging
+    logger = logging.getLogger("AlphaHunterStrategy")
+    logger.warning("使用标准 MatchEngine 代替 HighFreqMatcher")
+
+from engine.risk import RiskManager, PositionSizer
 
 
 @dataclass
@@ -171,86 +194,142 @@ class AlphaHunterStrategy(BaseStrategy):
         super().__init__(merged)
         
         # 因子引擎
-        self.factor_engine = AlphaHunterFactorEngine()
+        if FACTOR_ENGINE_AVAILABLE:
+            try:
+                self.factor_engine = AlphaHunterFactorEngine()
+                self.logger.info("✅ AlphaHunterFactorEngine 初始化成功")
+            except Exception as e:
+                self.logger.error(f"❌ AlphaHunterFactorEngine 初始化失败: {e}")
+                self.factor_engine = None
+        else:
+            self.factor_engine = None
         
         # 高频撮合器
-        self.hf_matcher = HighFreqMatcher()
+        try:
+            self.hf_matcher = HighFreqMatcher()
+            self.logger.info("✅ HighFreqMatcher 初始化成功")
+        except Exception as e:
+            self.logger.error(f"❌ HighFreqMatcher 初始化失败: {e}")
+            self.hf_matcher = None
+        
+        # 仓位管理器
+        self._position_sizer = PositionSizer(
+            risk_per_trade=self.params.get('risk_per_trade', 0.01),
+            atr_multiplier=self.params.get('atr_multiplier', 2.0),
+            min_position_pct=self.params.get('min_position_pct', 0.01),
+            max_position_pct=self.params.get('max_position_pct', 0.10)
+        )
+        
+        self._risk_manager = RiskManager()
         
         # 持仓状态
         self._positions: Dict[str, AlphaPosition] = {}
+        self._position_history = deque(maxlen=1000)
         
-        # 交易记录 (Kelly 计算用)
-        self._trade_history: deque = deque(maxlen=100)
+        # 交易记录 (用于 Kelly)
+        self._trade_history: List[TradeRecord] = []
+        self._consecutive_losses = 0
+        self._last_loss_date = None
+        self._suspended_until = None
+        
+        # Kelly 系数
+        self._kelly_fraction = np.clip(
+            self.params.get('kelly_fraction', 1.0),
+            0.5, 2.0
+        )
         
         # 市场情绪缓存
         self._market_breadth_cache: Dict = {}
         
         # 行业敞口
         self._sector_exposure: Dict[str, float] = {}
+        
+        self._validate_params()
+        self.logger.info(f"✅ AlphaHunterStrategy 初始化完成")
+    
+    def _validate_params(self):
+        """验证策略参数"""
+        required_params = ['rsrs_threshold', 'r2_threshold', 'market_breadth_threshold']
+        for param in required_params:
+            if param not in self.params:
+                raise ValueError(f"缺少必需参数: {param}")
+        
+        # 检查参数范围
+        if not (0 <= self.params['rsrs_threshold'] <= 1):
+            raise ValueError("rsrs_threshold 必须在 0 到 1 之间")
+        
+        if not (0 <= self.params['r2_threshold'] <= 1):
+            raise ValueError("r2_threshold 必须在 0 到 1 之间")
+        
+        if not (0 <= self.params['market_breadth_threshold'] <= 1):
+            raise ValueError("market_breadth_threshold 必须在 0 到 1 之间")
     
     def compute_factors(self, history: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-        """预计算因子"""
-        self.logger.info("Computing Alpha-Hunter factors...")
+        """计算所有因子"""
+        
+        if not history:
+            self.logger.warning("历史数据为空")
+            return {}
         
         factors = {}
-        rsrs_factor = AdvancedRSRSFactor()
-        pressure_factor = PressureLevelFactor()
         
-        rsrs_results = {}
-        pressure_results = {}
-        ma5_results = {}
-        
-        for code, df in history.items():
-            if len(df) < 250:
-                continue
+        try:
+            # 1. RSRS 因子
+            if self.factor_engine:
+                rsrs_dict = {}
+                for code, df in history.items():
+                    if df.empty or len(df) < 20:
+                        continue
+                    
+                    try:
+                        rsrs_series = self.factor_engine.compute_rsrs(df)
+                        
+                        # ✅ 验证返回值
+                        if rsrs_series is None or len(rsrs_series) == 0:
+                            continue
+                        
+                        rsrs_dict[code] = rsrs_series
+                    except Exception as e:
+                        self.logger.debug(f"[{code}] RSRS 计算失败: {e}")
+                        continue
+                
+                if rsrs_dict:
+                    factors['rsrs'] = pd.DataFrame(rsrs_dict)
             
-            try:
-                # RSRS
-                rsrs_data = rsrs_factor.compute_full(df)
-                rsrs_results[code] = rsrs_data
+            # 2. MA5 因子
+            ma5_dict = {}
+            for code, df in history.items():
+                if df.empty or 'close' not in df.columns:
+                    continue
                 
-                # 压力位
-                pressure_data = pressure_factor.compute_full(df)
-                pressure_results[code] = pressure_data
+                ma5 = df['close'].rolling(window=5, min_periods=1).mean()
                 
-                # MA5 及斜率
-                ma5 = df['close'].rolling(5).mean()
-                ma5_slope = ma5.diff(3) / ma5.shift(3)
-                ma5_results[code] = pd.DataFrame({
-                    'ma5': ma5,
-                    'ma5_slope': ma5_slope
-                }, index=df.index)
+                # ✅ 处理 NaN
+                if ma5.isna().sum() > 0:
+                    ma5 = ma5.fillna(method='ffill').fillna(method='bfill')
                 
-            except Exception as e:
-                self.logger.warning(f"Factor error for {code}: {e}")
+                ma5_dict[code] = ma5
+            
+            if ma5_dict:
+                factors['ma5'] = pd.DataFrame(ma5_dict)
+            
+            # 3. MA5 斜率
+            ma5_slope_dict = {}
+            for code in ma5_dict.keys():
+                ma5_series = factors['ma5'][code]
+                ma5_slope = ma5_series.diff() / ma5_series
+                ma5_slope = ma5_slope.fillna(0)
+                ma5_slope_dict[code] = ma5_slope
+            
+            if ma5_slope_dict:
+                factors['ma5_slope'] = pd.DataFrame(ma5_slope_dict)
+            
+            self.logger.info(f"因子计算完成: {list(factors.keys())}")
+            return factors
         
-        # 转换为宽表
-        if rsrs_results:
-            factors['rsrs_score'] = pd.DataFrame({
-                code: data['rsrs_final_score'] for code, data in rsrs_results.items()
-            })
-            factors['rsrs_r2'] = pd.DataFrame({
-                code: data['rsrs_r2'] for code, data in rsrs_results.items()
-            })
-            factors['rsrs_valid'] = pd.DataFrame({
-                code: data['rsrs_valid'] for code, data in rsrs_results.items()
-            })
-        
-        if pressure_results:
-            factors['pressure_distance'] = pd.DataFrame({
-                code: data['distance_to_pressure'] for code, data in pressure_results.items()
-            })
-        
-        if ma5_results:
-            factors['ma5'] = pd.DataFrame({
-                code: data['ma5'] for code, data in ma5_results.items()
-            })
-            factors['ma5_slope'] = pd.DataFrame({
-                code: data['ma5_slope'] for code, data in ma5_results.items()
-            })
-        
-        self.logger.info(f"Computed factors for {len(rsrs_results)} stocks")
-        return factors
+        except Exception as e:
+            self.logger.error(f"因子计算异常: {e}", exc_info=True)
+            return {}
     
     def generate_signals(self, context: StrategyContext) -> List[Signal]:
         """生成交易信号"""
@@ -533,7 +612,7 @@ class AlphaHunterStrategy(BaseStrategy):
             (current_data['turnover'] <= max_turnover) &  # 换手率
             (current_data['pressure'] >= min_pressure) &  # 压力距离
             (~current_data['name'].str.contains('ST', na=False)) & # 🔴 修复 Problem 21: 排除 ST 股票
-            (~current_data['name'].str.contains('\*', na=False))   # 排除 *ST 股票
+            (~current_data['name'].str.contains(r'\*', na=False))   # 排除 *ST 股票
         )
         
         # 非涨停过滤

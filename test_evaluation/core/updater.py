@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 import logging
 
-from .node_scanner import NodeScanner
+from .node_scanner import TDXNodeScanner as NodeScanner
 from .downloader import StockDownloader
 from .database import StockDatabase
 from config import settings
