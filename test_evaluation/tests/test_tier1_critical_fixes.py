@@ -289,8 +289,7 @@ class TestTPlusOneSettlement:
             status=OrderStatus.PARTIAL,
             filled_quantity=5000,
             filled_price=10.01,
-            commission=15.0,
-            total_cost=25.0
+            commission=15.0
         )
         
         portfolio.apply_order(order, '2024-01-01')
